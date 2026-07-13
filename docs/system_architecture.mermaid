@@ -1,0 +1,91 @@
+graph TB
+    subgraph Clients["Client Layer"]
+        MOB["Mobile App<br/>React Native / Expo<br/>iOS + Android"]
+        WEB["Web App<br/>React<br/>Family Tree / Desktop View"]
+    end
+
+    subgraph Edge["Edge"]
+        CADDY["Caddy<br/>Reverse Proxy + TLS"]
+        CDN["Cloudflare CDN"]
+    end
+
+    subgraph App["Application Layer — VPS + PM2"]
+        API["Node.js / Express API"]
+        AUTH["Auth / Session Middleware"]
+    end
+
+    subgraph Data["Data Stores"]
+        PG[("PostgreSQL + pgvector<br/>persons, relationships, memories,<br/>voice_models, flags, family_groups...")]
+        REDIS[("Redis<br/>cache / sessions / job queue")]
+        R2[("Cloudflare R2<br/>photos, voice, video")]
+        HOLD[("Holding Space<br/>unprocessed data for pending members")]
+    end
+
+    subgraph Jobs["Background Workers — BullMQ on Redis"]
+        Q_FACE["Face Detection / Matching Worker"]
+        Q_TRANS["Transcription Worker"]
+        Q_VOICE["Voice Cloning Worker"]
+        Q_EMBED["Embedding Worker<br/>semantic search"]
+        Q_NOTIF["Notification Dispatch Worker"]
+        Q_CRON["Scheduled Jobs<br/>camera roll scan, question prompts,<br/>nudges, subscription lifecycle"]
+    end
+
+    subgraph External["External AI / Third-Party APIs"]
+        CLAUDE["Anthropic Claude<br/>question gen, summaries, search"]
+        WHISPER["OpenAI Whisper<br/>transcription"]
+        ELEVEN["ElevenLabs<br/>voice cloning + TTS"]
+        VISION["AWS Rekognition / Google Vision<br/>face detection"]
+        DEEPL["DeepL<br/>translation"]
+    end
+
+    subgraph Notify["Notifications"]
+        PUSH["Expo Push"]
+        EMAIL["Transactional Email"]
+    end
+
+    subgraph Deploy["Deploy Pipeline — myMigo pattern"]
+        GIT["Git repo"]
+        EAS["EAS Build / EAS Update (OTA)"]
+        VPS["VPS: git pull → PM2 restart"]
+    end
+
+    MOB -->|HTTPS| CADDY
+    WEB -->|HTTPS| CADDY
+    MOB -.->|media fetch| CDN
+    WEB -.->|media fetch| CDN
+    CDN --> R2
+    CADDY --> API
+    API --> AUTH
+    API --> PG
+    API --> REDIS
+    API -->|upload/download| R2
+    API -->|writes pending data| HOLD
+    API -->|enqueue jobs| REDIS
+    API --> CLAUDE
+    API --> DEEPL
+
+    REDIS --> Q_FACE
+    REDIS --> Q_TRANS
+    REDIS --> Q_VOICE
+    REDIS --> Q_EMBED
+    REDIS --> Q_NOTIF
+    REDIS --> Q_CRON
+
+    Q_FACE --> VISION
+    Q_FACE -->|reads| HOLD
+    Q_FACE -->|writes matches| PG
+    Q_TRANS --> WHISPER
+    Q_TRANS --> PG
+    Q_VOICE --> ELEVEN
+    Q_VOICE --> PG
+    Q_EMBED --> CLAUDE
+    Q_EMBED -->|writes embeddings| PG
+    Q_CRON -->|triggers| API
+
+    Q_NOTIF --> PUSH
+    Q_NOTIF --> EMAIL
+    PUSH -.-> MOB
+    EMAIL -.-> MOB
+
+    GIT --> EAS --> MOB
+    GIT --> VPS --> API

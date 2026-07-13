@@ -1,0 +1,26 @@
+{
+  "expo": {
+    "name": "myFamiPedia",
+    "slug": "myfamipedia",
+    "scheme": "myfamipedia",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "plugins": ["expo-router", "expo-secure-store"],
+    "ios": {
+      "bundleIdentifier": "com.azerguia.myfamipedia",
+      "associatedDomains": ["applinks:app.myfamipedia.com"]
+    },
+    "android": {
+      "package": "com.azerguia.myfamipedia",
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [{ "scheme": "https", "host": "app.myfamipedia.com", "pathPrefix": "/invite" }],
+          "category": ["BROWSABLE", "DEFAULT"]
+        }
+      ]
+    }
+  }
+}

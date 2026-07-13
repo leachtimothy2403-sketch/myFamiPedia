@@ -1,0 +1,12 @@
+{
+  "name": "myfamipedia",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "postinstall": "pnpm build:shared",
+    "build:shared": "pnpm --filter @myfamipedia/shared build",
+    "dev:api": "pnpm --filter @myfamipedia/api dev",
+    "dev:mobile": "pnpm --filter @myfamipedia/mobile start",
+    "dev:web": "pnpm --filter @myfamipedia/web dev",
+    "migrate": "pnpm --filter @myfamipedia/api migrate",
+    "migrate:rollback": "pnpm --filter @myfamipedia/api migr

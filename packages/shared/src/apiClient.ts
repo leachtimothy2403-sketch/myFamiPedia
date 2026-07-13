@@ -1,0 +1,199 @@
+import type { RegisterInput, LoginInput, MagicLinkRequestInput } from "./schemas/auth.schemas";
+import type { CreateMemoryInput, ReactToMemoryInput } from "./schemas/memory.schemas";
+import type { SearchQueryInput } from "./schemas/search.schemas";
+import type { AddFamilyMemberInput } from "./schemas/person.schemas";
+
+// Token persistence differs by client (localStorage on web, SecureStore/
+// AsyncStorage on mobile) — the consuming app supplies an implementation
+// rather than this package assuming a browser or RN runtime.
+export interface TokenStore {
+  getAccessToken(): Promise<string | null>;
+  getRefreshToken(): Promise<string | null>;
+  setTokens(tokens: { accessToken: string; refreshToken: string }): Promise<void>;
+  clearTokens(): Promise<void>;
+}
+
+export class InMemoryTokenStore implements TokenStore {
+  private accessToken: string | null = null;
+  private refreshToken: string | null = null;
+  async getAccessToken() { return this.accessToken; }
+  async getRefreshToken() { return this.refreshToken; }
+  async setTokens(tokens: { accessToken: string; refreshToken: string }) {
+    this.accessToken = tokens.accessToken;
+    this.refreshToken = tokens.refreshToken;
+  }
+  async clearTokens() { this.accessToken = null; this.refreshToken = null; }
+}
+
+export interface ApiClientOptions {
+  baseUrl: string; // e.g. https://api.myfamipedia.com/api/v1
+  tokenStore?: TokenStore;
+}
+
+export class ApiError extends Error {
+  constructor(public status: number, message: string, public body?: unknown) {
+    super(message);
+  }
+}
+
+// Thin wrapper: typed convenience methods for the routes that matter most to
+// both clients, plus a generic `request()` escape hatch for everything else
+// in docs/api_structure.md so this file doesn't need one method per endpoint.
+export class ApiClient {
+  private baseUrl: string;
+  private tokenStore: TokenStore;
+  private refreshing: Promise<void> | null = null;
+
+  constructor(options: ApiClientOptions) {
+    this.baseUrl = options.baseUrl.replace(/\/$/, "");
+    this.tokenStore = options.tokenStore ?? new InMemoryTokenStore();
+  }
+
+  async request<T = unknown>(
+    path: string,
+    init: { method?: string; body?: unknown; auth?: boolean; idempotencyKey?: string } = {}
+  ): Promise<T> {
+    const { method = "GET", body, auth = true, idempotencyKey } = init;
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+
+    if (auth) {
+      const token = await this.tokenStore.getAccessToken();
+      if (token) headers.Authorization = `Bearer ${token}`;
+    }
+
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+
+    if (res.status === 401 && auth) {
+      await this.tryRefresh();
+      const token = await this.tokenStore.getAccessToken();
+      if (token) {
+        const retry = await fetch(`${this.baseUrl}${path}`, {
+          method,
+          headers: { ...headers, Authorization: `Bearer ${token}` },
+          body: body !== undefined ? JSON.stringify(body) : undefined,
+        });
+        return this.parse<T>(retry);
+      }
+    }
+    return this.parse<T>(res);
+  }
+
+  private async parse<T>(res: Response): Promise<T> {
+    if (res.status === 204) return undefined as T;
+    const text = await res.text();
+    const data = text ? JSON.parse(text) : undefined;
+    if (!res.ok) throw new ApiError(res.status, data?.message ?? res.statusText, data);
+    return data as T;
+  }
+
+  // Single in-flight refresh, shared across concurrent 401s.
+  private async tryRefresh(): Promise<void> {
+    if (!this.refreshing) {
+      this.refreshing = (async () => {
+        const refreshToken = await this.tokenStore.getRefreshToken();
+        if (!refreshToken) return;
+        try {
+          const data = await this.request<{ accessToken: string; refreshToken: string }>(
+            "/auth/refresh",
+            { method: "POST", body: { refreshToken }, auth: false }
+          );
+          await this.tokenStore.setTokens(data);
+        } catch {
+          await this.tokenStore.clearTokens();
+        }
+      })();
+      try {
+        await this.refreshing;
+      } finally {
+        this.refreshing = null;
+      }
+    } else {
+      await this.refreshing;
+    }
+  }
+
+  // --- Auth ---
+  async register(input: RegisterInput) {
+    const data = await this.request<{ accessToken: string; refreshToken: string }>(
+      "/auth/register",
+      { method: "POST", body: input, auth: false }
+    );
+    await this.tokenStore.setTokens(data);
+    return data;
+  }
+
+  async login(input: LoginInput) {
+    const data = await this.request<{ accessToken: string; refreshToken: string }>(
+      "/auth/login",
+      { method: "POST", body: input, auth: false }
+    );
+    await this.tokenStore.setTokens(data);
+    return data;
+  }
+
+  async requestMagicLink(input: MagicLinkRequestInput) {
+    return this.request<void>("/auth/magic-link/request", { method: "POST", body: input, auth: false });
+  }
+
+  async logout() {
+    await this.request<void>("/auth/logout", { method: "POST" });
+    await this.tokenStore.clearTokens();
+  }
+
+  // --- Tree / persons ---
+  async getFamilyTree(familyGroupId: string) {
+    return this.request(`/family-groups/${familyGroupId}/tree`);
+  }
+
+  async getPerson(personId: string) {
+    return this.request(`/persons/${personId}`);
+  }
+
+  async addFamilyMember(input: AddFamilyMemberInput) {
+    return this.request("/persons", { method: "POST", body: input });
+  }
+
+  // --- Memories ---
+  async createMemory(input: CreateMemoryInput) {
+    return this.request("/memories", { method: "POST", body: input });
+  }
+
+  async reactToMemory(memoryId: string, input: ReactToMemoryInput) {
+    return this.request(`/memories/${memoryId}/react`, { method: "POST", body: input });
+  }
+
+  async deleteMemory(memoryId: string) {
+    return this.request<void>(`/memories/${memoryId}`, { method: "DELETE" });
+  }
+
+  async retractMemory(memoryId: string) {
+    return this.request(`/memories/${memoryId}/retract`, { method: "POST" });
+  }
+
+  async restoreMemory(memoryId: string) {
+    return this.request(`/memories/${memoryId}/restore`, { method: "POST" });
+  }
+
+  // --- Search ---
+  async search(query: SearchQueryInput) {
+    const params = new URLSearchParams(query as unknown as Record<string, string>);
+    return this.request(`/search?${params.toString()}`);
+  }
+
+  // --- Uploads (presigned R2, see docs/api_structure.md cross-cutting notes) ---
+  async presignUpload(input: { contentType: string; context: "memory" | "photo" | "voice" }) {
+    return this.request<{ uploadUrl: string; uploadId: string; r2Key: string }>(
+      "/uploads/presign",
+      { method: "POST", body: input }
+    );
+  }
+
+  async completeUpload(uploadId: string) {
+    return this.request(`/uploads/${uploadId}/complete`, { method: "POST" });
+  }
+}
