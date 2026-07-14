@@ -26,7 +26,7 @@ app.use(express.json({ limit: "2mb" }));
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 const v1 = express.Router();
-v1.use(authRouter);
+v1.use("/auth", authRouter);
 v1.use(personsRouter);
 v1.use(memoriesRouter);
 v1.use(collectionRouter);
@@ -42,9 +42,14 @@ app.use("/api/v1", v1);
 
 app.use(errorHandler);
 
-app.listen(env.port, () => {
-  // eslint-disable-next-line no-console
-  console.log(`myFamiPedia API listening on :${env.port}`);
-});
+// Tests import this module purely to get the `app` object for supertest —
+// they set up their own pglite-backed DATABASE_URL and never want a real
+// listener bound (it would also fight over ports across parallel test files).
+if (env.nodeEnv !== "test") {
+  app.listen(env.port, () => {
+    // eslint-disable-next-line no-console
+    console.log(`myFamiPedia API listening on :${env.port}`);
+  });
+}
 
 export default app;

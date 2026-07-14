@@ -1,7 +1,8 @@
 import { Router } from "express";
 import { requireAuth, AuthedRequest, markAsAdministratorAction } from "../middleware/auth";
 import { withRlsContext } from "../db/pool";
-import { notImplemented } from "../utils/notImplemented";
+import { notificationQueue } from "../jobs/queue";
+import { HttpError } from "../utils/httpError";
 
 export const memoriesRouter = Router();
 
@@ -33,22 +34,22 @@ memoriesRouter.delete("/memories/:id", requireAuth, async (req: AuthedRequest, r
     const { personId, familyGroupId } = req.auth!;
     await withRlsContext({ personId, familyGroupId }, async (trx) => {
       const memory = await trx("memories").where({ id: req.params.id }).first();
-      if (!memory) throw new Error("Memory not found");
+      if (!memory) throw new HttpError(404, "Memory not found");
       if (memory.contributor_id !== personId) {
-        throw new Error("Only the original contributor can delete this memory");
+        throw new HttpError(403, "This memory cannot be deleted by anyone other than its original contributor");
       }
       if (memory.provenance_type === "voice") {
-        throw new Error("Voice-provenance memories cannot be hard-deleted, only retracted");
+        throw new HttpError(403, "Voice-provenance memories cannot be hard-deleted, only retracted");
       }
       if (memory.is_posthumous_contribution) {
-        throw new Error("Posthumous-profile contributions go through moderation, not self-delete");
+        throw new HttpError(403, "Posthumous-profile contributions cannot be self-deleted — they go through moderation instead");
       }
       const [reactionCount, otherPersonLinks] = await Promise.all([
         trx("reactions").where({ memory_id: memory.id }).count().first(),
         trx("memory_persons").where({ memory_id: memory.id }).whereNot({ person_id: personId }).first(),
       ]);
       if (Number(reactionCount?.count ?? 0) > 0 || otherPersonLinks) {
-        throw new Error("This memory is linked or reacted to — use retract instead of delete");
+        throw new HttpError(409, "This memory is linked or reacted to — use retract instead of delete");
       }
       await trx("memories").where({ id: memory.id }).del(); // the DB trigger is the real backstop, this check is the friendly error path
     });
@@ -58,6 +59,94 @@ memoriesRouter.delete("/memories/:id", requireAuth, async (req: AuthedRequest, r
   }
 });
 
-memoriesRouter.post("/memories/:id/retract", requireAuth, notImplemented("docs/data_model.md#memory-deletion-policy"));
-memoriesRouter.post("/memories/:id/restore-request", requireAuth, markAsAdministratorAction, notImplemented("docs/data_model.md#memory-deletion-policy"));
-memoriesRouter.post("/memories/:id/restore", requireAuth, notImplemented("docs/data_model.md#memory-deletion-policy"));
+// Soft-hides a linked/reacted (or voice, or simply preferred) memory. Contributor only.
+// Notifies anyone who reacted to it — see docs/data_model.md's three-tier policy,
+// tier 2. Posthumous contributions are excluded here too: those only ever move
+// through the flags/moderation path (tier 3), never a unilateral contributor action.
+memoriesRouter.post("/memories/:id/retract", requireAuth, async (req: AuthedRequest, res, next) => {
+  try {
+    const { personId, familyGroupId } = req.auth!;
+    await withRlsContext({ personId, familyGroupId }, async (trx) => {
+      const memory = await trx("memories").where({ id: req.params.id }).first();
+      if (!memory) throw new HttpError(404, "Memory not found");
+      if (memory.contributor_id !== personId) {
+        throw new HttpError(403, "This memory cannot be retracted by anyone other than its original contributor");
+      }
+      if (memory.is_posthumous_contribution) {
+        throw new HttpError(403, "Posthumous-profile contributions cannot be self-retracted — they go through moderation instead");
+      }
+      if (memory.retracted) {
+        throw new HttpError(409, "This memory has already been retracted");
+      }
+
+      const reactors = await trx("reactions").where({ memory_id: memory.id }).distinct("person_id");
+      await trx("memories").where({ id: memory.id }).update({ retracted: true, retracted_at: new Date() });
+
+      await Promise.all(
+        reactors.map((r: { person_id: string }) =>
+          notificationQueue.add("memory-retracted", {
+            recipientPersonId: r.person_id,
+            type: "memory_retracted",
+            payload: { memoryId: memory.id },
+          })
+        )
+      );
+    });
+    res.status(204).send();
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Administrator-only: notifies the original contributor that a restore has
+// been requested. Does NOT flip `retracted` itself — only the contributor's
+// own POST /restore can do that (enforced by the route below, and backstopped
+// by the memory_retraction_self_only RLS policy).
+memoriesRouter.post(
+  "/memories/:id/restore-request",
+  requireAuth,
+  markAsAdministratorAction,
+  async (req: AuthedRequest, res, next) => {
+    try {
+      const { personId, familyGroupId } = req.auth!;
+      await withRlsContext(
+        { personId, familyGroupId, actingAsAdministrator: true },
+        async (trx) => {
+          const memory = await trx("memories").where({ id: req.params.id }).first();
+          if (!memory) throw new HttpError(404, "Memory not found");
+          if (!memory.retracted) throw new HttpError(409, "This memory is not retracted, so there is nothing to restore");
+
+          await notificationQueue.add("memory-restore-requested", {
+            recipientPersonId: memory.contributor_id,
+            type: "memory_restore_requested",
+            payload: { memoryId: memory.id, requestedBy: personId },
+          });
+        }
+      );
+      res.status(204).send();
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// Contributor only — reverses a retraction. Administrators cannot call this
+// directly; they can only ask via restore-request above.
+memoriesRouter.post("/memories/:id/restore", requireAuth, async (req: AuthedRequest, res, next) => {
+  try {
+    const { personId, familyGroupId } = req.auth!;
+    await withRlsContext({ personId, familyGroupId }, async (trx) => {
+      const memory = await trx("memories").where({ id: req.params.id }).first();
+      if (!memory) throw new HttpError(404, "Memory not found");
+      if (memory.contributor_id !== personId) {
+        throw new HttpError(403, "This memory cannot be restored by anyone other than its original contributor");
+      }
+      if (!memory.retracted) throw new HttpError(409, "This memory is not retracted, so there is nothing to restore");
+
+      await trx("memories").where({ id: memory.id }).update({ retracted: false, retracted_at: null });
+    });
+    res.status(204).send();
+  } catch (err) {
+    next(err);
+  }
+});

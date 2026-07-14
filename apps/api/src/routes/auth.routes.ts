@@ -86,9 +86,6 @@ authRouter.post("/refresh", async (req, res) => {
 // TODO: also revoke the session in Redis once the session store is wired up (see docs/system_architecture.mermaid).
 authRouter.post("/logout", (_req, res) => res.status(204).send());
 
-authRouter.post("/persons/:id/administrator/nominate", notImplemented("docs/api_structure.md#auth--session"));
-authRouter.post("/persons/:id/administrator/confirm", notImplemented("docs/api_structure.md#auth--session"));
-
 function issueTokens(userId: string, personId: string, familyGroupId: string) {
   const payload = { userId, personId, familyGroupId };
   const accessToken = jwt.sign(payload, env.jwtAccessSecret, { expiresIn: "15m" });

@@ -10,7 +10,9 @@
     "migrate": "knex migrate:latest --knexfile src/db/knexfile.ts",
     "migrate:rollback": "knex migrate:rollback --knexfile src/db/knexfile.ts",
     "seed": "knex seed:run --knexfile src/db/knexfile.ts",
-    "lint": "eslint src --ext .ts"
+    "lint": "eslint src --ext .ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@myfamipedia/shared": "workspace:*",
@@ -30,6 +32,14 @@
     "@types/jsonwebtoken": "^9.0.6",
     "@types/node": "^20.14.10",
     "tsx": "^4.16.2",
-    "typescript": "^5.5.3"
+    "typescript": "^5.5.3",
+    "vitest": "^2.0.5",
+    "supertest": "^7.0.0",
+    "@types/supertest": "^6.0.2",
+    "@electric-sql/pglite": "0.5.4",
+    "@electric-sql/pglite-socket": "0.2.7",
+    "get-port": "^7.1.0",
+    "@electric-sql/pglite-pgvector": "0.0.5",
+    "@types/pg": "^8.11.6"
   }
 }
