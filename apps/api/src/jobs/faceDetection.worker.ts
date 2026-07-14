@@ -1,5 +1,5 @@
 import { Worker, Job } from "bullmq";
-import { connection } from "./queue";
+import { connection, embeddingQueue } from "./queue";
 import { withServiceContext } from "../db/pool";
 import { getObjectBuffer } from "../services/r2.service";
 import { visionService as defaultVisionService, collectionIdFor, VisionService } from "../services/vision.service";
@@ -57,6 +57,12 @@ export async function processDetectJob(data: DetectJobData, deps: FaceDetectionD
       if (result.proposalId) createdProposals.push(result.proposalId);
     }
   });
+
+  // Every tier-1 auto-committed memory needs its embedding generated too —
+  // enqueued after the transaction commits, not inside commitMatchedFace,
+  // since BullMQ enqueueing isn't part of the DB transaction and shouldn't
+  // block on it.
+  await Promise.all(createdMemories.map((memoryId) => embeddingQueue.add("embed-memory", { memoryId })));
 
   // Unmatched faces are deliberately not persisted anywhere (docs/media_pipeline.md
   // section 2 step 4: "nothing is written to photo_persons or any biometric

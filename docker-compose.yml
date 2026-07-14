@@ -1,0 +1,31 @@
+# Local dev infra only — not used in production (see docs for the real
+# Postgres/Redis setup there). Spins up a Postgres with pgvector pre-built
+# and a Redis, both matching the defaults in .env.example, so `pnpm migrate`
+# and `pnpm workers` work out of the box with zero manual DB setup.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: myfamipedia
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: myfamipedia
+    ports:
+      - "5433:5432"
+    volumes:
+      - myfamipedia-pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myfamipedia -d myfamipedia"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+
+volumes:
+  myfamipedia-pgdata:

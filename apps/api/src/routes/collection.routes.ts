@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { withRlsContext } from "../db/pool";
-import { faceDetectionQueue } from "../jobs/queue";
+import { faceDetectionQueue, embeddingQueue } from "../jobs/queue";
 import { HttpError } from "../utils/httpError";
 import { notImplemented } from "../utils/notImplemented";
 
@@ -36,7 +36,13 @@ collectionRouter.post("/collection/camera-roll/sync", requireAuth, async (req: A
         .returning("*")
     );
 
-    await Promise.all(inserted.map((photo: { id: string }) => faceDetectionQueue.add("detect", { photoId: photo.id })));
+    await Promise.all(
+      inserted.map((photo: { id: string }) => faceDetectionQueue.add("detect", { photoId: photo.id }))
+    );
+    // Every photo gets embedded in image mode too (docs/search.md's
+    // "photos upload complete -> embed the image" trigger), independent of
+    // whatever face-detection finds.
+    await Promise.all(inserted.map((photo: { id: string }) => embeddingQueue.add("embed-photo", { photoId: photo.id })));
     res.status(201).json({ items: inserted });
   } catch (err) {
     next(err);
@@ -60,19 +66,23 @@ collectionRouter.get("/collection/proposed", requireAuth, async (req: AuthedRequ
 collectionRouter.post("/collection/proposed/:id/accept", requireAuth, async (req: AuthedRequest, res, next) => {
   try {
     const { personId, familyGroupId } = req.auth!;
-    await withRlsContext({ personId, familyGroupId }, async (trx) => {
+    const memoryId = await withRlsContext({ personId, familyGroupId }, async (trx) => {
       const proposal = await trx("proposed_memories").where({ id: req.params.id }).first();
       if (!proposal) throw new HttpError(404, "Proposed memory not found");
       if (proposal.status !== "pending") throw new HttpError(409, "This proposal has already been resolved");
 
-      await trx("memories").insert({
-        family_group_id: familyGroupId,
-        contributor_id: personId,
-        provenance_type: "photo",
-        media_url: null,
-      });
+      const [memory] = await trx("memories")
+        .insert({
+          family_group_id: familyGroupId,
+          contributor_id: personId,
+          provenance_type: "photo",
+          media_url: null,
+        })
+        .returning("id");
       await trx("proposed_memories").where({ id: proposal.id }).update({ status: "accepted" });
+      return memory.id;
     });
+    await embeddingQueue.add("embed-memory", { memoryId });
     res.status(204).send();
   } catch (err) {
     next(err);

@@ -191,4 +191,135 @@ describe("persons", () => {
       expect(res.status).toBe(400);
     });
   });
+
+  describe("posthumous contribution (Section 4)", () => {
+    it("creates a deceased profile in 'collecting' state, with no invitation row", async () => {
+      const res = await ctx
+        .request()
+        .post(`/api/v1/persons/deceased`)
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ name: "Grandpa Joe", deathDate: "2015-06-01", relationshipType: "parent_of", relatedToPersonId: user.personId });
+      expect(res.status).toBe(201);
+      expect(res.body.status).toBe("deceased");
+      expect(res.body.deceased_profile_state).toBe("collecting");
+      expect(res.body.administrator_person_id).toBe(user.personId);
+
+      const invitations = await ctx.knex()("invitations").where({ person_id: res.body.id });
+      expect(invitations).toHaveLength(0);
+      const relationships = await ctx.knex()("relationships").where({ person_b_id: res.body.id });
+      expect(relationships).toHaveLength(1);
+    });
+
+    it("requires name, deathDate, relationshipType, and relatedToPersonId", async () => {
+      const res = await ctx
+        .request()
+        .post(`/api/v1/persons/deceased`)
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ name: "Grandpa Joe" });
+      expect(res.status).toBe(400);
+    });
+
+    describe("PATCH /persons/:id/state", () => {
+      async function createDeceased() {
+        const res = await ctx
+          .request()
+          .post(`/api/v1/persons/deceased`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ name: "Grandma Rose", deathDate: "2018-03-01", relationshipType: "parent_of", relatedToPersonId: user.personId });
+        return res.body;
+      }
+
+      it("moves collecting -> complete for the profile's administrator", async () => {
+        const deceased = await createDeceased();
+        const res = await ctx
+          .request()
+          .patch(`/api/v1/persons/${deceased.id}/state`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ state: "complete" });
+        expect(res.status).toBe(200);
+        expect(res.body.deceased_profile_state).toBe("complete");
+      });
+
+      it("rejects a non-administrator", async () => {
+        const deceased = await createDeceased();
+        const other = await registerTestUser(ctx.request);
+        const res = await ctx
+          .request()
+          .patch(`/api/v1/persons/${deceased.id}/state`)
+          .set("Authorization", `Bearer ${other.accessToken}`)
+          .send({ state: "complete" });
+        expect(res.status).toBe(403);
+      });
+
+      it("rejects state changes on a non-deceased profile", async () => {
+        const res = await ctx
+          .request()
+          .patch(`/api/v1/persons/${user.personId}/state`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ state: "complete" });
+        expect(res.status).toBe(409);
+      });
+
+      it("validates the state value", async () => {
+        const deceased = await createDeceased();
+        const res = await ctx
+          .request()
+          .patch(`/api/v1/persons/${deceased.id}/state`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ state: "bogus" });
+        expect(res.status).toBe(400);
+      });
+    });
+
+    describe("POST /persons/:id/memories", () => {
+      it("lets any family member contribute a memory, marked posthumous, and enqueues embedding", async () => {
+        const deceased = await ctx
+          .request()
+          .post(`/api/v1/persons/deceased`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ name: "Uncle Theo", deathDate: "2019-09-01", relationshipType: "sibling_of", relatedToPersonId: user.personId })
+          .then((r) => r.body);
+
+        const res = await ctx
+          .request()
+          .post(`/api/v1/persons/${deceased.id}/memories`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ content: "He always made us laugh." });
+        expect(res.status).toBe(201);
+        expect(res.body.is_posthumous_contribution).toBe(true);
+        expect(res.body.contributor_id).toBe(user.personId);
+        expect(res.body.provenance_type).toBe("text");
+
+        const links = await ctx.knex()("memory_persons").where({ memory_id: res.body.id, person_id: deceased.id });
+        expect(links).toHaveLength(1);
+
+        const { getQueueMock } = await import("../helpers/queueMock");
+        expect(getQueueMock("embeddingQueue").add).toHaveBeenCalledWith("embed-memory", { memoryId: res.body.id });
+      });
+
+      it("rejects contributing to a living person's profile", async () => {
+        const res = await ctx
+          .request()
+          .post(`/api/v1/persons/${user.personId}/memories`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ content: "This should fail" });
+        expect(res.status).toBe(409);
+      });
+
+      it("requires content or mediaUrl", async () => {
+        const deceased = await ctx
+          .request()
+          .post(`/api/v1/persons/deceased`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ name: "Aunt May", deathDate: "2020-01-01", relationshipType: "sibling_of", relatedToPersonId: user.personId })
+          .then((r) => r.body);
+        const res = await ctx
+          .request()
+          .post(`/api/v1/persons/${deceased.id}/memories`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({});
+        expect(res.status).toBe(400);
+      });
+    });
+  });
 });

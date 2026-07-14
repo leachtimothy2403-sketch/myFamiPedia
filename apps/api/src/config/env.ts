@@ -1,3 +1,19 @@
+// dotenv must load before anything below reads process.env. The repo's .env
+// lives at the workspace root (see .env.example there, and the README's
+// quickstart which does `cp .env.example .env` from the root) — not inside
+// apps/api — so this points at an explicit path rather than relying on
+// dotenv's cwd-relative default, since `pnpm --filter @myfamipedia/api <script>`
+// runs with cwd set to apps/api, not the root. Using an explicit path also
+// means this works the same whether it's the tsx-run src file or the
+// compiled dist/config/env.js (same relative depth under apps/api either way).
+// dotenv.config() never overwrites a process.env var that's already set, so
+// this is safe with the test harness's ordering trick (tests/helpers/testDb.ts
+// sets process.env.DATABASE_URL to a pglite socket URL before this module is
+// ever imported — see that file's docstring for why the ordering matters).
+import path from "node:path";
+import dotenv from "dotenv";
+dotenv.config({ path: path.resolve(__dirname, "../../../../.env") });
+
 // Central place to read process.env — every other module imports from here,
 // never reads process.env directly, so a missing var fails loudly at startup.
 function required(name: string): string {

@@ -1,5 +1,5 @@
 import { Worker, Job } from "bullmq";
-import { connection } from "./queue";
+import { connection, embeddingQueue } from "./queue";
 import { withServiceContext } from "../db/pool";
 import { getObjectBuffer } from "../services/r2.service";
 import { visionService as defaultVisionService, collectionIdFor, VisionService } from "../services/vision.service";
@@ -54,13 +54,18 @@ export async function processDrainJob(data: DrainJobData, deps: HoldingSpaceDrai
   );
 
   const newlyMatchedPhotoIds: string[] = [];
+  const newlyCreatedMemoryIds: string[] = [];
   for (const photo of candidatePhotos) {
     const bytes = await deps.getBytes(photo.r2_key);
     const matches = await deps.vision.searchFacesByImage(collectionId, bytes);
     if (!matches.some((m) => m.externalImageId === personId)) continue;
-    await withServiceContext((trx) => commitMatchedFace(trx, photo, person));
+    const result = await withServiceContext((trx) => commitMatchedFace(trx, photo, person));
     newlyMatchedPhotoIds.push(photo.id);
+    if (result.memoryId) newlyCreatedMemoryIds.push(result.memoryId);
   }
+  // Same reasoning as faceDetection.worker.ts: enqueue embeddings for any
+  // tier-1 auto-committed memories once the retroactive scan is done.
+  await Promise.all(newlyCreatedMemoryIds.map((memoryId) => embeddingQueue.add("embed-memory", { memoryId })));
 
   // Step 3: archive (not delete) every holding_space row for this person,
   // regardless of media_type — kept for provenance per the doc.

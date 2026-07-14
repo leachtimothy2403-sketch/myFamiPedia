@@ -15,3 +15,12 @@ export async function presignUpload(_key: string): Promise<{ url: string; key: s
 export async function getObjectBuffer(_key: string): Promise<Buffer> {
   throw new Error(`Not implemented — wire up @aws-sdk/client-s3 against R2 account ${env.r2.accountId}`);
 }
+
+// Needed by the daily cron sweep's grace-period expiry step (docs/media_pipeline.md
+// section 4: "holding_space rows... deleted (DB rows + R2 objects per
+// lifecycle rule)"). The sweep calls this best-effort — a missing R2
+// integration shouldn't block the DB-side cleanup, which is real, useful
+// progress on its own even before storage deletion is wired up.
+export async function deleteObject(_key: string): Promise<void> {
+  throw new Error(`Not implemented — wire up @aws-sdk/client-s3 against R2 account ${env.r2.accountId}`);
+}

@@ -2,6 +2,8 @@ import { Router } from "express";
 import { requireAuth, AuthedRequest, markAsAdministratorAction } from "../middleware/auth";
 import { withRlsContext } from "../db/pool";
 import { notImplemented } from "../utils/notImplemented";
+import { HttpError } from "../utils/httpError";
+import { embeddingQueue } from "../jobs/queue";
 
 export const personsRouter = Router();
 
@@ -180,13 +182,149 @@ personsRouter.post("/relationships", requireAuth, async (req: AuthedRequest, res
   }
 });
 
-// Section 4 (posthumous contribution) is scoped out of this pass: the
-// current schema's persons.status enum ('active'|'invited_pending'|
-// 'declined_grace'|'opted_out'|'deceased') has no "collecting" vs "complete"
-// sub-state for a deceased profile to move between, which PATCH
-// /persons/:id/state depends on. Implementing these three routes needs a
-// small schema decision first (a new column, or repurposing profile_data)
-// rather than a route-only change — left as stubs pending that decision.
-personsRouter.post("/persons/deceased", requireAuth, markAsAdministratorAction, notImplemented("docs/api_structure.md#posthumous-contribution-section-4"));
-personsRouter.patch("/persons/:id/state", requireAuth, markAsAdministratorAction, notImplemented("docs/api_structure.md#posthumous-contribution-section-4"));
-personsRouter.post("/persons/:id/memories", requireAuth, notImplemented("docs/api_structure.md#posthumous-contribution-section-4"));
+// Section 4 (posthumous contribution). Creating a deceased profile has no
+// invitation step at all — "no one to invite" (docs/data_model.md's "Adding
+// a family member — living vs. deceased branch") — so this is a straight
+// persons + relationships insert, no invitations row. The creator becomes
+// the profile's administrator; there's no separate nomination step for a
+// deceased person's admin the way there is for a living member's
+// (auth.routes.ts's nominate/confirm), since there's no one alive at that
+// profile to confirm anything.
+personsRouter.post(
+  "/persons/deceased",
+  requireAuth,
+  markAsAdministratorAction,
+  async (req: AuthedRequest, res, next) => {
+    try {
+      const { personId, familyGroupId } = req.auth!;
+      const { name, birthDate, deathDate, relationshipType, relatedToPersonId, profileData } = req.body ?? {};
+      if (!name || !deathDate || !relationshipType || !relatedToPersonId) {
+        return res
+          .status(400)
+          .json({ error: "name, deathDate, relationshipType, and relatedToPersonId are required" });
+      }
+
+      const result = await withRlsContext({ personId, familyGroupId }, async (trx) => {
+        const [person] = await trx("persons")
+          .insert({
+            family_group_id: familyGroupId,
+            name,
+            birth_date: birthDate ?? null,
+            death_date: deathDate,
+            status: "deceased",
+            deceased_profile_state: "collecting",
+            administrator_person_id: personId,
+            profile_data: profileData ?? {},
+          })
+          .returning("*");
+
+        await trx("relationships").insert({
+          person_a_id: relatedToPersonId,
+          person_b_id: person.id,
+          relationship_type: relationshipType,
+        });
+
+        return person;
+      });
+
+      res.status(201).json(result);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// collecting <-> complete, administrator only. "Administrator" here means
+// the profile's own administrator_person_id — set once, at creation, above
+// — not the family-group-wide sense used elsewhere (there's no separate
+// nomination flow for a deceased profile's admin).
+personsRouter.patch(
+  "/persons/:id/state",
+  requireAuth,
+  markAsAdministratorAction,
+  async (req: AuthedRequest, res, next) => {
+    try {
+      const { personId, familyGroupId } = req.auth!;
+      const { state } = req.body ?? {};
+      if (!["collecting", "complete"].includes(state)) {
+        return res.status(400).json({ error: "state must be 'collecting' or 'complete'" });
+      }
+
+      const person = await withRlsContext(
+        { personId, familyGroupId, actingAsAdministrator: true },
+        async (trx) => {
+          const existing = await trx("persons").where({ id: req.params.id }).first();
+          if (!existing) throw new HttpError(404, "Person not found");
+          if (existing.status !== "deceased") {
+            throw new HttpError(409, "Only a deceased profile has a collecting/complete state");
+          }
+          if (existing.administrator_person_id !== personId) {
+            throw new HttpError(403, "This profile's state can only be changed by its administrator");
+          }
+          const [updated] = await trx("persons")
+            .where({ id: req.params.id })
+            .update({ deceased_profile_state: state, updated_at: new Date() })
+            .returning("*");
+          return updated;
+        }
+      );
+      res.json(person);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// "Any family member contributes memory/photo/story" — no admin gate here,
+// unlike the state route above; the profile's administrator only curates
+// the collecting/complete state, not who's allowed to contribute. Voice and
+// ai_generated provenance are excluded on purpose: there's no one left to
+// interview, and posthumous contributions are explicitly first-person
+// family recollections, not synthesized content (docs/data_model.md's
+// three-tier deletion policy also treats is_posthumous_contribution
+// memories as never self-deletable/retractable, only reachable through
+// moderation — matching that a real person is vouching for this content).
+personsRouter.post("/persons/:id/memories", requireAuth, async (req: AuthedRequest, res, next) => {
+  try {
+    const { personId, familyGroupId } = req.auth!;
+    const { content, mediaUrl, eventDate, provenanceType, photoId } = req.body ?? {};
+    if (!content && !mediaUrl) {
+      return res.status(400).json({ error: "content or mediaUrl is required" });
+    }
+    const resolvedProvenance = provenanceType ?? (mediaUrl || photoId ? "photo" : "text");
+    if (!["text", "photo"].includes(resolvedProvenance)) {
+      return res.status(400).json({ error: "provenanceType must be 'text' or 'photo' for a posthumous contribution" });
+    }
+
+    const memory = await withRlsContext({ personId, familyGroupId }, async (trx) => {
+      const subject = await trx("persons").where({ id: req.params.id }).first();
+      if (!subject) throw new HttpError(404, "Person not found");
+      if (subject.status !== "deceased") {
+        throw new HttpError(409, "Posthumous contributions can only be made to a deceased profile");
+      }
+
+      const [created] = await trx("memories")
+        .insert({
+          family_group_id: familyGroupId,
+          contributor_id: personId,
+          content: content ?? null,
+          media_url: mediaUrl ?? null,
+          event_date: eventDate ?? null,
+          provenance_type: resolvedProvenance,
+          is_posthumous_contribution: true,
+        })
+        .returning("*");
+
+      await trx("memory_persons").insert({ memory_id: created.id, person_id: subject.id });
+      if (photoId) {
+        await trx("memory_photos").insert({ memory_id: created.id, photo_id: photoId });
+      }
+      return created;
+    });
+
+    await embeddingQueue.add("embed-memory", { memoryId: memory.id });
+    res.status(201).json(memory);
+  } catch (err) {
+    next(err);
+  }
+});

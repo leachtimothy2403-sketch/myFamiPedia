@@ -1,110 +1,68 @@
-# myFamiPedia
+# myFamiPedia — .env was never actually loaded (real root cause)
 
-AI-powered family memory and genealogy platform — a living, interactive family
-knowledge graph. Built by Azerguia (SASU).
+## What was wrong
 
-Repo: https://github.com/leachtimothy2403-sketch/myFamiPedia.git
+No code anywhere in `apps/api` called `dotenv.config()` or otherwise loaded
+`.env` into `process.env`. `src/config/env.ts` reads `process.env.DATABASE_URL`
+etc. directly, but a `.env` file sitting on disk does nothing on its own —
+Node doesn't read it unless something tells it to. So every edit to `.env`
+(the Docker port remap to 5433/6380 included) was silently ignored, and the
+app kept falling back to its hardcoded default
+(`postgres://myfamipedia:changeme@localhost:5432/myfamipedia`) — which is
+why `migrate` kept hitting port 5432 (your other project's Postgres
+container) no matter what `.env` said.
 
-## Structure
+This is a pre-existing gap in the original scaffold, not something you did
+wrong — it just hadn't been exercised until now since this looks like the
+first time `.env` needed to actually take effect.
 
-```
-apps/
-  api/      Node.js / Express backend — Postgres + pgvector, Redis, BullMQ workers
-  mobile/   React Native / Expo app (iOS + Android)
-  web/      React web app — family tree desktop view
-packages/
-  shared/   TypeScript types, Zod schemas, and API client shared by mobile + web
-docs/       Full technical architecture (system diagram, API spec, data model,
-            pipelines, privacy model, app structure, cost model)
-```
+## The fix
 
-`docs/` is the source of truth this scaffold was generated from. Read those
-before making structural changes — most design decisions (privacy enforcement,
-consent flows, the retraction/delete policy, the invitation state machine) are
-explained there, not just implemented in code.
+`apps/api/src/config/env.ts` now does:
 
-## Getting started
-
-This is a **pnpm workspace** (see `pnpm-workspace.yaml`) — the `@myfamipedia/api`
-and `@myfamipedia/web` packages depend on `@myfamipedia/shared` via the
-`workspace:*` protocol, which plain `npm install` does not understand and will
-fail on with `EUNSUPPORTEDPROTOCOL`. Use pnpm:
-
-```bash
-corepack enable                 # ships with Node 20+; activates the pinned pnpm version below
-pnpm install                    # also builds packages/shared once, via postinstall
-cp .env.example .env            # fill in real credentials
-pnpm migrate                    # runs apps/api's Knex migrations against DATABASE_URL
-pnpm dev:api                    # Express API on :3000
-pnpm dev:web                    # Vite dev server
-pnpm dev:mobile                 # Expo dev server
-pnpm workers                    # background workers (face detection, transcription, voice cloning, ...)
+```ts
+import path from "node:path";
+import dotenv from "dotenv";
+dotenv.config({ path: path.resolve(__dirname, "../../../../.env") });
 ```
 
-If `corepack enable` fails with a permissions error (writing into
-`Program Files\nodejs` needs admin rights on Windows), skip it and run
-`npx pnpm install` instead, then `npx pnpm dev:api` etc. in place of the plain
-`pnpm` commands. Or run PowerShell "as Administrator" once for `corepack
-enable` and use `pnpm` directly afterward.
+An explicit path is used (not dotenv's cwd-relative default) because
+`pnpm --filter @myfamipedia/api <script>` runs with cwd set to `apps/api`,
+while the actual `.env` lives at the repo root (matching `.env.example` and
+the README's quickstart). `dotenv.config()` never overwrites a `process.env`
+var that's already set, so this stays compatible with the test harness's
+existing ordering trick (`tests/helpers/testDb.ts` sets
+`process.env.DATABASE_URL` to a pglite socket URL before `config/env.ts` is
+ever imported) — verified by running the suite both with and without a real
+root `.env` present.
 
-Requires Postgres 15+ with the `pgvector` and `pgcrypto` extensions available,
-and Redis for BullMQ.
+Adds `dotenv` (^16.4.5) as a real dependency (needed at runtime, not just
+dev) — `package.json` and `pnpm-lock.yaml` are both included so
+`pnpm install` won't need to re-resolve anything.
 
-If you add or change anything in `packages/shared`, run `pnpm build:shared`
-before the api/web dev servers will pick it up (there's no watch mode wired
-up yet — `pnpm --filter @myfamipedia/shared dev` runs `tsc --watch` if you
-want one open in a spare terminal).
+## Verification
 
-## Status
+- `tsc --noEmit`: clean.
+- Confirmed `env.databaseUrl`/`env.redisUrl` correctly pick up a root `.env`'s
+  values when imported the way `pnpm --filter @myfamipedia/api migrate` runs
+  it (cwd = `apps/api`).
+- `persons.test.ts` (20), `scheduledJobs.worker.test.ts` (13),
+  `subscription.test.ts` (4), `notification.worker.test.ts` (3) all pass —
+  run once with no `.env` present, and again with a real root `.env` present,
+  to confirm no leakage into the pglite test harness either way.
 
-`apps/api` has a real, tested implementation behind every route in
-`docs/api_structure.md` — auth, tree, memories, persons, invitations,
-collection/camera-roll, voice consent, interviews, moderation, notifications,
-subscription, and keyword-mode search. Semantic-mode search returns a clear
-501 (needs a Voyage embedding call, see below). Full DB schema + RLS, 15
-migrations, all verified against an in-memory pglite Postgres via a real
-integration test suite (`apps/api/tests`, 120 tests, `pnpm --filter
-@myfamipedia/api test`) that runs the actual Express handlers over a real
-Postgres wire protocol connection — not a reimplementation. A GitHub Actions
-workflow (`.github/workflows/api-tests.yml`) runs this suite on every push/PR.
+## Apply
 
-The five async pipelines (face detection, holding-space-drain-on-acceptance,
-interview transcription, voice cloning, notifications) have real BullMQ
-workers in `apps/api/src/jobs/*.worker.ts` (alongside `queue.ts`, matching
-the scaffold's existing convention and `ecosystem.config.js`'s PM2 process
-pointing at `dist/jobs/runWorkers.js`), run as a separate process
-(`pnpm --filter @myfamipedia/api workers`, or `pnpm workers` from the repo
-root). Their DB orchestration —
-transitions, tier-1/2/3 branching, archiving, RLS-safe writes — is real and
-tested against fakes; only the actual external API calls are conditionally
-stubbed, and only where genuinely necessary:
-- **Real, working today** given the right API key: transcription (OpenAI
-  Whisper), voice cloning (ElevenLabs), embeddings (Voyage AI) — see
-  `apps/api/src/services/{transcription,voiceClone,embeddings}.service.ts`.
-- **Still a deliberate stub**: face detection/recognition (needs
-  `@aws-sdk/client-rekognition` and real AWS credentials — SigV4 signing
-  isn't something to hand-roll) and R2 object storage (needs
-  `@aws-sdk/client-s3`) — see `vision.service.ts` and `r2.service.ts`. Every
-  worker that depends on these is fully implemented and tested against a
-  fake; only this one boundary in each is unfinished.
+```powershell
+Expand-Archive -Path myfamipedia-dotenv-fix.zip -DestinationPath . -Force
+npx pnpm install
+```
 
-Workers run under a `withServiceContext` DB helper (`app.service_role` RLS
-GUC) rather than a per-request person/family context, since a background job
-often has neither — see `src/db/pool.ts`'s doc comment and migration
-`015_service_role_and_missing_write_policies.js` for why that migration was
-needed (several tables had RLS enabled with no INSERT policy at all, which
-is invisible in tests since pglite always runs as a superuser that bypasses
-RLS, but would have silently blocked real writes in production).
+Then retry:
 
-A shared `packages/shared` (types + Zod schemas + a fetch-based `ApiClient`
-used by both clients) and route scaffolds for both mobile (Expo Router) and
-web (Vite + React Router) exist matching their respective app-structure docs,
-but their business logic (wiring screens to real API calls, state
-management) is not yet implemented — that's the next layer to build.
+```powershell
+npx pnpm --filter @myfamipedia/api migrate
+```
 
-`packages/shared`, `apps/api`, and `apps/web` all type-check clean
-(`pnpm exec tsc --noEmit`). `apps/mobile` was reviewed by hand rather than
-compiled — its Expo/React Native dependency tree is heavy enough that a full
-`pnpm install` didn't reliably finish in this environment; worth running
-`pnpm install && pnpm exec tsc --noEmit` inside `apps/mobile` once you have a
-normal dev machine, as a first sanity check.
+This should now actually connect to port 5433 (your Docker Postgres), not
+5432 — and succeed.

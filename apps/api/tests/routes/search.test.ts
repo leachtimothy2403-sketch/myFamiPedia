@@ -1,8 +1,20 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { withApp, registerTestUser, type TestUser } from "../helpers/withApp";
 import { mockQueues } from "../helpers/queueMock";
 
 mockQueues();
+
+// Semantic mode needs a query embedding — mocked the same way the BullMQ
+// queues are (queueMock.ts), rather than hitting the real Voyage API.
+vi.mock("../../src/services/embeddings.service", () => ({
+  embeddingService: { embedText: vi.fn(), embedImage: vi.fn() },
+}));
+
+function vectorLiteral(values: number[]): string {
+  return `[${values.join(",")}]`;
+}
+const CLOSE_VECTOR = Array.from({ length: 1024 }, (_, i) => i / 1024);
+const FAR_VECTOR = Array.from({ length: 1024 }, (_, i) => 1 - i / 1024);
 
 describe("search", () => {
   const ctx = withApp();
@@ -38,9 +50,91 @@ describe("search", () => {
     expect(res.status).toBe(400);
   });
 
-  it("501s semantic mode rather than silently falling back", async () => {
-    const res = await ctx.request().get("/api/v1/search?q=x&mode=semantic").set("Authorization", `Bearer ${user.accessToken}`);
-    expect(res.status).toBe(501);
+  it("rejects a mode that isn't keyword or semantic", async () => {
+    const res = await ctx.request().get("/api/v1/search?q=x&mode=bogus").set("Authorization", `Bearer ${user.accessToken}`);
+    expect(res.status).toBe(400);
+  });
+
+  describe("semantic mode", () => {
+    it("ranks memories and photos together by embedding similarity, using the query embedding", async () => {
+      const { embeddingService } = await import("../../src/services/embeddings.service");
+      vi.mocked(embeddingService.embedText).mockResolvedValue([CLOSE_VECTOR]);
+
+      const closeMemory = await memory({ content: "close match" });
+      await ctx
+        .knex()("memories")
+        .where({ id: closeMemory.id })
+        .update({ embedding: ctx.knex().raw("?::vector", [vectorLiteral(CLOSE_VECTOR)]) });
+
+      const farMemory = await memory({ content: "far match" });
+      await ctx
+        .knex()("memories")
+        .where({ id: farMemory.id })
+        .update({ embedding: ctx.knex().raw("?::vector", [vectorLiteral(FAR_VECTOR)]) });
+
+      const [photo] = await ctx
+        .knex()("photos")
+        .insert({
+          family_group_id: user.familyGroupId,
+          r2_key: "photos/close.jpg",
+          uploaded_by: user.personId,
+          embedding: ctx.knex().raw("?::vector", [vectorLiteral(CLOSE_VECTOR)]),
+        })
+        .returning("*");
+
+      const res = await ctx
+        .request()
+        .get("/api/v1/search?q=anything&mode=semantic")
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(200);
+      expect(embeddingService.embedText).toHaveBeenCalledWith(["anything"]);
+      expect(res.body.items.length).toBeGreaterThanOrEqual(3);
+      expect(res.body.items[0].result_type).toBe("memory");
+      expect(res.body.items[0].id).toBe(closeMemory.id);
+
+      const photoResult = res.body.items.find((i: { result_type: string; id: string }) => i.result_type === "photo" && i.id === photo.id);
+      expect(photoResult).toBeTruthy();
+      expect(photoResult.preview).toBe("photos/close.jpg");
+
+      const farIndex = res.body.items.findIndex((i: { id: string }) => i.id === farMemory.id);
+      const closeIndex = res.body.items.findIndex((i: { id: string }) => i.id === closeMemory.id);
+      expect(closeIndex).toBeLessThan(farIndex);
+    });
+
+    it("excludes memories/photos with no embedding yet rather than erroring", async () => {
+      const { embeddingService } = await import("../../src/services/embeddings.service");
+      vi.mocked(embeddingService.embedText).mockResolvedValue([CLOSE_VECTOR]);
+      await memory({ content: "not yet embedded" });
+
+      const res = await ctx
+        .request()
+        .get("/api/v1/search?q=anything&mode=semantic")
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(200);
+      expect(res.body.items).toHaveLength(0);
+    });
+
+    it("media_type=photo restricts to just the photos leg", async () => {
+      const { embeddingService } = await import("../../src/services/embeddings.service");
+      vi.mocked(embeddingService.embedText).mockResolvedValue([CLOSE_VECTOR]);
+
+      const m = await memory({ content: "a memory" });
+      await ctx.knex()("memories").where({ id: m.id }).update({ embedding: ctx.knex().raw("?::vector", [vectorLiteral(CLOSE_VECTOR)]) });
+      await ctx.knex()("photos").insert({
+        family_group_id: user.familyGroupId,
+        r2_key: "photos/only.jpg",
+        uploaded_by: user.personId,
+        embedding: ctx.knex().raw("?::vector", [vectorLiteral(CLOSE_VECTOR)]),
+      });
+
+      const res = await ctx
+        .request()
+        .get("/api/v1/search?q=anything&mode=semantic&media_type=photo")
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(200);
+      expect(res.body.items).toHaveLength(1);
+      expect(res.body.items[0].result_type).toBe("photo");
+    });
   });
 
   it("filters by date range and provenance/media type", async () => {

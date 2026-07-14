@@ -1,5 +1,5 @@
 import { Worker, Job } from "bullmq";
-import { connection } from "./queue";
+import { connection, embeddingQueue } from "./queue";
 import { withServiceContext } from "../db/pool";
 import { getObjectBuffer } from "../services/r2.service";
 import { transcriptionService as defaultTranscriptionService, TranscriptionService } from "../services/transcription.service";
@@ -62,6 +62,7 @@ export async function processTranscribeJob(data: TranscribeJobData, deps: Transc
     return memory.id;
   });
 
+  await embeddingQueue.add("embed-memory", { memoryId });
   return { interviewAnswerId, memoryId };
 }
 
