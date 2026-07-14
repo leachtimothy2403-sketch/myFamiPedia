@@ -9,7 +9,8 @@
     "dev:mobile": "pnpm --filter @myfamipedia/mobile start",
     "dev:web": "pnpm --filter @myfamipedia/web dev",
     "migrate": "pnpm --filter @myfamipedia/api migrate",
-    "migrate:rollback": "pnpm --filter @myfamipedia/api migrate:rollback"
+    "migrate:rollback": "pnpm --filter @myfamipedia/api migrate:rollback",
+    "workers": "pnpm --filter @myfamipedia/api workers"
   },
   "engines": {
     "node": ">=20"

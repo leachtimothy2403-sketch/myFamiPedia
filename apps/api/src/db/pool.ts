@@ -46,3 +46,22 @@ export async function withTokenContext<T>(
     return fn(trx);
   });
 }
+
+// Background workers (src/jobs/*.worker.ts) have no request, no logged-in person,
+// and often touch rows across many different family groups in one job
+// (e.g. the holding-space-drain worker re-scanning a whole family's photo
+// library) — there's no single app.current_person_id/current_family_group_id
+// that would make sense to set. docs/privacy_enforcement.md calls this out
+// explicitly: "the one other real deletion path ... runs exclusively from
+// the Q_CRON worker under a service role that bypasses RLS by design."
+// Rather than a second Postgres role/credential (real infra work, out of
+// scope for a single shared DATABASE_URL), this sets a session GUC that
+// every RLS policy touched by a worker OR's into its check — see migration
+// 015_service_role_and_missing_write_policies.js. Only call this from
+// worker code, never from a request handler.
+export async function withServiceContext<T>(fn: (trx: knexFactory.Knex.Transaction) => Promise<T>): Promise<T> {
+  return db.transaction(async (trx) => {
+    await trx.raw("SELECT set_config('app.service_role', 'true', true)");
+    return fn(trx);
+  });
+}

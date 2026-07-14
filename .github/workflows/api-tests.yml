@@ -1,0 +1,35 @@
+# Runs the apps/api integration test suite (vitest + an in-memory pglite
+# Postgres, no external services needed — see apps/api/tests/helpers/testDb.ts)
+# on every push and PR. Doesn't touch apps/mobile or apps/web: mobile's
+# Expo/React Native install is heavy enough that it's better checked
+# separately (see README's "Status" note), and web has no test suite yet.
+name: API tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Enable corepack (pins the pnpm version from package.json)
+        run: corepack enable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check
+        working-directory: apps/api
+        run: pnpm exec tsc --noEmit
+
+      - name: Run tests
+        working-directory: apps/api
+        run: pnpm test

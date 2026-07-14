@@ -12,7 +12,8 @@
     "seed": "knex seed:run --knexfile src/db/knexfile.ts",
     "lint": "eslint src --ext .ts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "workers": "tsx watch src/jobs/runWorkers.ts"
   },
   "dependencies": {
     "@myfamipedia/shared": "workspace:*",
