@@ -2,6 +2,7 @@ import type { RegisterInput, LoginInput, MagicLinkRequestInput } from "./schemas
 import type { CreateMemoryInput, ReactToMemoryInput } from "./schemas/memory.schemas";
 import type { SearchQueryInput } from "./schemas/search.schemas";
 import type { Person, Relationship, RelationshipType } from "./types/person";
+import type { Memory } from "./types/memory";
 import { camelizeKeys } from "./lib/caseTransform";
 
 // Token persistence differs by client (localStorage on web, SecureStore/
@@ -191,7 +192,7 @@ export class ApiClient {
 
   // --- Memories ---
   async createMemory(input: CreateMemoryInput) {
-    return this.request("/memories", { method: "POST", body: input });
+    return this.request<Memory>("/memories", { method: "POST", body: input });
   }
 
   async reactToMemory(memoryId: string, input: ReactToMemoryInput) {

@@ -1,10 +1,69 @@
 import { Router } from "express";
 import { requireAuth, AuthedRequest, markAsAdministratorAction } from "../middleware/auth";
 import { withRlsContext } from "../db/pool";
-import { notificationQueue } from "../jobs/queue";
+import { notificationQueue, embeddingQueue } from "../jobs/queue";
 import { HttpError } from "../utils/httpError";
 
 export const memoriesRouter = Router();
+
+// General memory creation — the living-person counterpart to
+// persons.routes.ts's POST /persons/:id/memories, which is deceased-profile
+// only ("posthumous contribution", Section 4). This is everything else: a
+// memory about yourself or a living relative. personIds tags who it
+// features (memory_persons) — the feed/timeline queries in persons.routes.ts
+// match on contributor_id OR memory_persons, so tagging the profile you're
+// adding this about is what makes it show up there.
+//
+// mediaUrl/photoIds are accepted per createMemorySchema but nothing can
+// populate them yet — presigning an upload needs R2 credentials that aren't
+// configured (src/services/r2.service.ts, deliberately stubbed), so this
+// only ever gets exercised as a text memory for now.
+memoriesRouter.post("/memories", requireAuth, async (req: AuthedRequest, res, next) => {
+  try {
+    const { personId, familyGroupId } = req.auth!;
+    const { content, mediaUrl, eventDate, provenanceType, isPrivate, personIds, photoIds } = req.body ?? {};
+    if (!content && !mediaUrl) {
+      return res.status(400).json({ error: "content or mediaUrl is required" });
+    }
+    const resolvedProvenance = provenanceType ?? (mediaUrl || photoIds?.length ? "photo" : "text");
+    if (!["voice", "photo", "text", "ai_generated"].includes(resolvedProvenance)) {
+      return res.status(400).json({ error: "invalid provenanceType" });
+    }
+
+    const memory = await withRlsContext({ personId, familyGroupId }, async (trx) => {
+      const [created] = await trx("memories")
+        .insert({
+          family_group_id: familyGroupId,
+          contributor_id: personId,
+          content: content ?? null,
+          media_url: mediaUrl ?? null,
+          event_date: eventDate ?? null,
+          provenance_type: resolvedProvenance,
+          is_private: Boolean(isPrivate),
+        })
+        .returning("*");
+
+      const taggedPersonIds: string[] = Array.isArray(personIds) ? personIds : [];
+      if (taggedPersonIds.length) {
+        await trx("memory_persons").insert(
+          taggedPersonIds.map((pid) => ({ memory_id: created.id, person_id: pid }))
+        );
+      }
+      if (Array.isArray(photoIds) && photoIds.length) {
+        await trx("memory_photos").insert(
+          photoIds.map((pid: string) => ({ memory_id: created.id, photo_id: pid }))
+        );
+      }
+
+      return created;
+    });
+
+    await embeddingQueue.add("embed-memory", { memoryId: memory.id });
+    res.status(201).json(memory);
+  } catch (err) {
+    next(err);
+  }
+});
 
 memoriesRouter.post("/memories/:id/react", requireAuth, async (req: AuthedRequest, res, next) => {
   try {
