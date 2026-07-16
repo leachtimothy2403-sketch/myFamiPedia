@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { hasSession } from "./lib/session";
 
 import LoginRoute from "./routes/login";
+import RegisterRoute from "./routes/register";
 import InviteLandingRoute from "./routes/invite/[token]";
 import TreeRoute from "./routes/tree/index";
 import PersonProfileRoute from "./routes/person/[id]/index";
@@ -28,6 +29,7 @@ export default function App() {
   return (
     <Routes>
       <Route path="/login" element={<LoginRoute />} />
+      <Route path="/register" element={<RegisterRoute />} />
       <Route path="/invite/:token" element={<InviteLandingRoute />} />
 
       <Route path="/tree" element={<RequireAuth><TreeRoute /></RequireAuth>} />

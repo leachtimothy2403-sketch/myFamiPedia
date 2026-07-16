@@ -5,5 +5,6 @@ export function useFamilyTree(familyGroupId: string) {
   return useQuery({
     queryKey: ["family-tree", familyGroupId],
     queryFn: () => apiClient.getFamilyTree(familyGroupId),
+    enabled: Boolean(familyGroupId),
   });
 }

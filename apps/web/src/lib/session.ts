@@ -28,3 +28,45 @@ export const localStorageTokenStore: TokenStore = {
 export function hasSession(): boolean {
   return localStorage.getItem(REFRESH_KEY) !== null;
 }
+
+// The API never gained a dedicated "/auth/me" endpoint, and login (unlike
+// register) doesn't echo the person back in its response body — but
+// personId/familyGroupId are already sitting in the JWT payload the API
+// issues (auth.routes.ts's issueTokens), so decoding it client-side avoids
+// an extra round-trip or an API change. This is a plain base64 decode, not a
+// signature check — fine for reading UI-routing claims, since the server
+// re-verifies the token on every real request regardless.
+function decodeJwtPayload<T = unknown>(token: string): T | null {
+  try {
+    const payload = token.split(".")[1];
+    const json = atob(payload.replace(/-/g, "+").replace(/_/g, "/"));
+    return JSON.parse(json) as T;
+  } catch {
+    return null;
+  }
+}
+
+interface SessionClaims {
+  userId: string;
+  personId: string;
+  familyGroupId: string;
+}
+
+function currentClaims(): SessionClaims | null {
+  const token = localStorage.getItem(REFRESH_KEY);
+  if (!token) return null;
+  return decodeJwtPayload<SessionClaims>(token);
+}
+
+export function getPersonId(): string | null {
+  return currentClaims()?.personId ?? null;
+}
+
+export function getFamilyGroupId(): string | null {
+  return currentClaims()?.familyGroupId ?? null;
+}
+
+export function clearSession(): void {
+  localStorage.removeItem(ACCESS_KEY);
+  localStorage.removeItem(REFRESH_KEY);
+}

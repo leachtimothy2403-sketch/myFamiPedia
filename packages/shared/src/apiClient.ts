@@ -1,7 +1,8 @@
 import type { RegisterInput, LoginInput, MagicLinkRequestInput } from "./schemas/auth.schemas";
 import type { CreateMemoryInput, ReactToMemoryInput } from "./schemas/memory.schemas";
 import type { SearchQueryInput } from "./schemas/search.schemas";
-import type { AddFamilyMemberInput } from "./schemas/person.schemas";
+import type { Person, Relationship, RelationshipType } from "./types/person";
+import { camelizeKeys } from "./lib/caseTransform";
 
 // Token persistence differs by client (localStorage on web, SecureStore/
 // AsyncStorage on mobile) — the consuming app supplies an implementation
@@ -88,7 +89,7 @@ export class ApiClient {
     const text = await res.text();
     const data = text ? JSON.parse(text) : undefined;
     if (!res.ok) throw new ApiError(res.status, data?.message ?? res.statusText, data);
-    return data as T;
+    return data === undefined ? (data as T) : camelizeKeys<T>(data);
   }
 
   // Single in-flight refresh, shared across concurrent 401s.
@@ -147,15 +148,45 @@ export class ApiClient {
 
   // --- Tree / persons ---
   async getFamilyTree(familyGroupId: string) {
-    return this.request(`/family-groups/${familyGroupId}/tree`);
+    return this.request<{ persons: Person[]; relationships: Relationship[] }>(
+      `/family-groups/${familyGroupId}/tree`
+    );
   }
 
   async getPerson(personId: string) {
-    return this.request(`/persons/${personId}`);
+    return this.request<Person>(`/persons/${personId}`);
   }
 
-  async addFamilyMember(input: AddFamilyMemberInput) {
-    return this.request("/persons", { method: "POST", body: input });
+  // "Add family member" — living branch. There is no plain POST /persons
+  // route; a living person is always created together with the invitation
+  // that will eventually let them log in (apps/api's invitations.routes.ts).
+  // Returns a shareableLink when neither inviteeEmail nor inviteePhone is
+  // given, per that route's documented MVP fallback.
+  async inviteFamilyMember(input: {
+    name: string;
+    relationshipType: RelationshipType;
+    relatedToPersonId: string;
+    inviteeEmail?: string | null;
+    inviteePhone?: string | null;
+  }) {
+    return this.request<{ person: Person; invitation: unknown; shareableLink?: string }>("/invitations", {
+      method: "POST",
+      body: input,
+    });
+  }
+
+  // "Add family member" — deceased branch (Section 4). No invitation step:
+  // "no one to invite" (docs/data_model.md). deathDate is required by the
+  // route itself, not just recommended.
+  async addDeceasedProfile(input: {
+    name: string;
+    relationshipType: RelationshipType;
+    relatedToPersonId: string;
+    birthDate?: string | null;
+    deathDate: string;
+    profileData?: Record<string, unknown>;
+  }) {
+    return this.request<Person>("/persons/deceased", { method: "POST", body: input });
   }
 
   // --- Memories ---

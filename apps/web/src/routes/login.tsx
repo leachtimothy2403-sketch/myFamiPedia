@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, Link } from "react-router-dom";
 import { apiClient } from "../lib/apiClient";
 
 // Password or magic-link email sign-in — same /auth/* endpoints as mobile.
@@ -42,6 +42,9 @@ export default function LoginRoute() {
         <button type="submit">Log in</button>
       </form>
       <button onClick={onMagicLink}>Send me a magic link instead</button>
+      <p>
+        New here? <Link to="/register">Create your family's space</Link>
+      </p>
       {message ? <p>{message}</p> : null}
     </div>
   );
