@@ -42,7 +42,7 @@ export default function PersonProfileRoute() {
   if (personLoading) return <p style={{ padding: 24 }}>Loading…</p>;
   if (personError || !person) return <p style={{ padding: 24 }}>Couldn't load this profile.</p>;
 
-  const timelineEvents = (timeline?.items ?? []).map((m) => ({
+  const timelineEvents = (timeline?.items ?? []).map((m: Memory) => ({
     id: m.id,
     date: m.eventDate,
     label: m.content ?? (m.mediaUrl ? "Photo memory" : "Memory"),

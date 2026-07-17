@@ -16,7 +16,7 @@ export default function ModerationQueueRoute() {
   return (
     <div style={{ padding: 24 }}>
       <h1>Moderation queue</h1>
-      {(data?.items ?? []).map((item) => (
+      {(data?.items ?? []).map((item: { id: string; description: string }) => (
         <div key={item.id} style={{ marginBottom: 12 }}>
           <p>{item.description}</p>
           <button onClick={() => resolve.mutate({ id: item.id, status: "removed" })}>Remove</button>
