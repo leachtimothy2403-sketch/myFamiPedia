@@ -10,6 +10,7 @@
     "dev:web": "pnpm --filter @myfamipedia/web dev",
     "migrate": "pnpm --filter @myfamipedia/api migrate",
     "migrate:rollback": "pnpm --filter @myfamipedia/api migrate:rollback",
+    "seed": "pnpm --filter @myfamipedia/api seed",
     "workers": "pnpm --filter @myfamipedia/api workers"
   },
   "engines": {

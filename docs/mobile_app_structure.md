@@ -27,9 +27,6 @@ app/
     manage.tsx                         # browse/manage already-added memories; delete affordance TBD, see note below
     settings.tsx                       # privacy tier (1/2/3) + question frequency
   interview/
-    new.tsx                            # subject picker: defaults to self, "record for someone else" opens a dropdown of tree profiles
-    [personId]/
-      new.tsx                          # pick question set, or start from a photo (camera capture or library)
     session/
       [sessionId].tsx                  # active recording flow, question-by-question or photo-prompted; camera/library button stays live throughout, not just pre-session
   voice/
@@ -56,7 +53,9 @@ Explore is no longer a separate tab — `tree.tsx` now carries a segmented contr
 
 ## Share your story (renamed from Record a conversation)
 
-`interview/new.tsx` defaults the subject to the current user's own `person_id` — tapping the tab goes straight into "answer some questions about your own life," no picker required. A visible "record for someone else" control opens a dropdown of the family tree's profiles (same data source as the tree/person screens) for the facilitated-elder case the doc originally centered this feature on. Both paths converge on the same `[personId]/new.tsx` → `session/[sessionId].tsx` flow; only the pre-selected subject differs.
+One screen (`(tabs)/share-story.tsx`), progressive reveal — no more "Get started" hop. "Whose story is this?" (My own story / Record someone else) sits right under the header; choosing "someone else" reveals a picker of the family tree's profiles (same data source as the tree/person screens). Once a subject is resolved, the three starting-point choices appear in place below: open-ended, Q&A, or photo-prompted. All three push straight to `session/[sessionId].tsx`.
+
+Q&A calls `GET /interview-questions/next?personId=` rather than always taking the first curated question — it works through the shared bank in `sort_order` first, then (once exhausted for that person) a Claude-generated follow-up built from their prior transcripts/memories (migration 022, `docs/section2_pipeline.md` section 4's pattern reused for the live session, not just the async push). Needs `ANTHROPIC_API_KEY` set to generate follow-ups, and transcripts only exist once `OPENAI_API_KEY` is set and answers have actually been transcribed — with neither configured, Q&A just cycles the curated bank, which still works.
 
 Within a session, a photo can serve as a conversation starter, a mid-conversation illustration, or an after-the-fact attachment: a camera-capture button (physical photo digitization, `photos.source='physical_scan'`) sits alongside the usual library picker, and it stays reachable the whole time recording is active — not just before the session starts. Someone can snap or pick a photo the instant a memory comes up mid-sentence without pausing the conversation. Capture during an active recording must go through an in-app camera view rather than launching the OS camera app, since handing off to a system camera would suspend the app and cut the audio (see voice pipeline doc for the timing mechanics — mid-answer photos land in `interview_answer_photos` and get promoted to `memory_photos` once the answer is transcribed). Same underlying pipeline either way: upload → face-match → embed, just three different entry points into it.
 

@@ -1,12 +1,12 @@
 # myFamiPedia — Voice Pipeline
 
-Recording → Whisper transcription → ElevenLabs cloning → four-moment consent flow.
+Recording → ElevenLabs Scribe transcription → ElevenLabs cloning → four-moment consent flow.
 
 ## 1. Recording → transcript (every session, always)
 
 1. Facilitated interview session (Section 3) or an ad-hoc voice memory records locally on-device, uploads to R2 on completion (`interview_answers.audio_r2_key` or `memories.media_url`).
 2. `POST /interview-sessions/:id/complete` enqueues one `Q_TRANS` job per answer.
-3. Worker calls Whisper API, writes `transcript` back onto `interview_answers`, then creates the corresponding `memories` row (`provenance_type = 'voice'`, `provenance_label` auto-set e.g. "Recorded by Marie with Hélène, March 2026").
+3. Worker calls ElevenLabs' Speech-to-Text API (`scribe_v2`), writes `transcript` back onto `interview_answers`, then creates the corresponding `memories` row (`provenance_type = 'voice'`, `provenance_label` auto-set e.g. "Recorded by Marie with Hélène, March 2026"). Originally used OpenAI Whisper; switched to ElevenLabs since the project already needs an ElevenLabs key for cloning below, and Scribe v2 benchmarks at or above Whisper v3 on accuracy (particularly non-English) — see section 5. This removed `OPENAI_API_KEY` from the required env vars.
 4. Same worker checks `interview_answer_photos` for that answer — any photo captured or uploaded mid-recording (see below) gets copied into `memory_photos` against the newly created `memory_id`.
 5. `Q_NOTIF` fires "[Grandmother] just shared 6 new memories" once all answers in the session are transcribed.
 
@@ -42,4 +42,6 @@ This path is independent of voice cloning — transcription and real-audio playb
 
 ## 5. Cost/ops notes
 
-Whisper: ~$0.006/min, billed per `Q_TRANS` job — cheap enough to run on every answer unconditionally. ElevenLabs cloning/TTS calls are the more expensive, rate-limited leg — worth queuing with retry/backoff rather than calling inline from the API request path, since a facilitator finishing a session shouldn't block on clone training.
+ElevenLabs Scribe v2 transcription: billed per `Q_TRANS` job, priced per audio minute — cheap enough to run on every answer unconditionally. ElevenLabs cloning/TTS calls are the more expensive, rate-limited leg — worth queuing with retry/backoff rather than calling inline from the API request path, since a facilitator finishing a session shouldn't block on clone training.
+
+**Why ElevenLabs over OpenAI here (as of mid-2026):** independent benchmarks (FLEURS, Common Voice) put Scribe's word error rate at or below Whisper v3's, with a bigger gap on non-English languages — relevant since myFamiPedia expects multilingual families. OpenAI's Whisper successor, `gpt-4o-transcribe`, narrows that gap (~4.1% WER vs Whisper v3's 5.3%) and its `-diarize` variant adds automatic speaker labeling, which Scribe v2 also supports natively (`diarize: true`, up to 32 speakers) — not turned on here since each interview answer is currently treated as one speaker's transcript, but worth revisiting if facilitator/subject cross-talk within an answer ever needs separating. OpenAI's other angle worth knowing about: real-time streaming transcription (`gpt-realtime-whisper`), which could power live captions during recording rather than only a transcript afterward — Scribe v2 Realtime offers the same idea (sub-150ms latency) if that's wanted without adding OpenAI back in.

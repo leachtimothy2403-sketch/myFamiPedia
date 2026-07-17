@@ -9,7 +9,7 @@ describe("transcription worker", () => {
   const ctx = withDb();
 
   it("creates a voice-provenance memory, links the subject, promotes staged photos, and updates the answer row", async () => {
-    const { processTranscribeJob } = await import("../../src/jobs/transcription.worker");
+    const { processTranscribeJob } = await import("../../src/jobs/transcribeAnswer");
     const knex = ctx.knex();
 
     const [group] = await knex("family_groups").insert({ name: "Test Family" }).returning("*");
@@ -62,7 +62,7 @@ describe("transcription worker", () => {
   });
 
   it("throws a clear error for an unknown interview answer id", async () => {
-    const { processTranscribeJob } = await import("../../src/jobs/transcription.worker");
+    const { processTranscribeJob } = await import("../../src/jobs/transcribeAnswer");
     const transcription: TranscriptionService = { transcribe: vi.fn(async () => "x") };
     const getBytes = vi.fn(async () => Buffer.from(""));
 

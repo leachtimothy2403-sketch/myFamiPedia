@@ -89,7 +89,11 @@ export class ApiClient {
     if (res.status === 204) return undefined as T;
     const text = await res.text();
     const data = text ? JSON.parse(text) : undefined;
-    if (!res.ok) throw new ApiError(res.status, data?.message ?? res.statusText, data);
+    // Server errors are shaped { error: message } (see apps/api's errorHandler),
+    // not { message: ... } — this was reading the wrong key, so every thrown
+    // ApiError across both clients showed a generic status text ("Not Found")
+    // instead of the real server message. body is still preserved either way.
+    if (!res.ok) throw new ApiError(res.status, data?.error ?? data?.message ?? res.statusText, data);
     return data === undefined ? (data as T) : camelizeKeys<T>(data);
   }
 
@@ -212,9 +216,25 @@ export class ApiClient {
   }
 
   // --- Search ---
+  // apps/api's search.routes.ts reads plain snake_case query params
+  // (date_from, date_to, media_type) straight off req.query — it doesn't go
+  // through camelizeKeys the way responses do, since that's a response-body
+  // transform. Building URLSearchParams directly from SearchQueryInput's
+  // camelCase keys silently sent the wrong param names for those three
+  // fields, and stringified any unset optional field (person, dateFrom,
+  // dateTo, mediaType, contributor) into the literal string "undefined"
+  // (URLSearchParams coerces object values with String()). Neither bug
+  // surfaced before now — no frontend called search() until this session.
   async search(query: SearchQueryInput) {
-    const params = new URLSearchParams(query as unknown as Record<string, string>);
-    return this.request(`/search?${params.toString()}`);
+    const params = new URLSearchParams();
+    params.set("q", query.q);
+    params.set("mode", query.mode);
+    if (query.person) params.set("person", query.person);
+    if (query.dateFrom) params.set("date_from", query.dateFrom);
+    if (query.dateTo) params.set("date_to", query.dateTo);
+    if (query.mediaType) params.set("media_type", query.mediaType);
+    if (query.contributor) params.set("contributor", query.contributor);
+    return this.request<{ items: unknown[] }>(`/search?${params.toString()}`);
   }
 
   // --- Uploads (presigned R2, see docs/api_structure.md cross-cutting notes) ---

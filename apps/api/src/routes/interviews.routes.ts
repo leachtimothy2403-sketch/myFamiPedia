@@ -2,7 +2,10 @@ import { Router } from "express";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { withRlsContext } from "../db/pool";
 import { transcriptionQueue } from "../jobs/queue";
+import { processTranscribeJob } from "../jobs/transcribeAnswer";
 import { HttpError } from "../utils/httpError";
+import { generateFollowUpQuestion } from "../services/claude.service";
+import { env } from "../config/env";
 
 export const interviewsRouter = Router();
 
@@ -12,11 +15,112 @@ interviewsRouter.get("/interview-questions", requireAuth, async (req: AuthedRequ
     const { personId, familyGroupId } = req.auth!;
     const { lifePhase } = req.query;
     const rows = await withRlsContext({ personId, familyGroupId }, (trx) => {
-      const q = trx("interview_questions").orderBy("sort_order");
+      const q = trx("interview_questions").where({ source: "curated" }).orderBy("sort_order");
       return lifePhase ? q.where({ life_phase: lifePhase }) : q;
     });
     res.json(rows);
   } catch (err) {
+    next(err);
+  }
+});
+
+// Adaptive Q&A (docs/section2_pipeline.md section 4): work through the
+// shared curated bank in sort_order first (general questions), then once
+// it's exhausted for this person, generate a follow-up that digs into
+// something they've actually talked about — reusing any not-yet-answered
+// generated question already on file before asking Claude for a new one, so
+// re-opening this screen doesn't burn a Claude call every time.
+interviewsRouter.get("/interview-questions/next", requireAuth, async (req: AuthedRequest, res, next) => {
+  try {
+    const { personId: facilitatorPersonId, familyGroupId } = req.auth!;
+    const subjectPersonId = String(req.query.personId ?? facilitatorPersonId);
+
+    const result = await withRlsContext({ personId: facilitatorPersonId, familyGroupId }, async (trx) => {
+      const person = await trx("persons").where({ id: subjectPersonId }).first();
+      if (!person) throw new HttpError(404, "Person not found");
+
+      const answeredQuestionIds = (
+        await trx("interview_answers as ia")
+          .join("interview_sessions as s", "s.id", "ia.session_id")
+          .where({ "s.person_id": subjectPersonId })
+          .whereNotNull("ia.question_id")
+          .distinct("ia.question_id")
+      ).map((r: { question_id: string }) => r.question_id);
+
+      // `whereNotIn("id", [])` (nothing answered yet) used to be papered
+      // over with `whereNotIn("id", [null])` — but SQL's `id NOT IN (NULL)`
+      // evaluates to unknown for every row, which WHERE treats as false. So
+      // on literally anyone's first-ever Q&A tap, both queries below matched
+      // nothing and it fell straight through to generating a follow-up
+      // before a single curated question had ever been asked. Only apply
+      // the exclusion when there's actually something to exclude.
+      const curatedQuery = trx("interview_questions").where({ source: "curated" }).orderBy("sort_order");
+      if (answeredQuestionIds.length) curatedQuery.whereNotIn("id", answeredQuestionIds);
+      const nextCurated = await curatedQuery.first();
+      if (nextCurated) return nextCurated;
+
+      const generatedQuery = trx("interview_questions")
+        .where({ source: "generated", person_id: subjectPersonId })
+        .orderBy("created_at", "desc");
+      if (answeredQuestionIds.length) generatedQuery.whereNotIn("id", answeredQuestionIds);
+      const unusedGenerated = await generatedQuery.first();
+      if (unusedGenerated) return unusedGenerated;
+
+      // Nothing left curated or on-hand — build a follow-up from this
+      // person's life-story Q&A only (curated + previously generated
+      // interview answers), not the broader `memories` table, which mixes
+      // in unrelated freeform "share a memory"/photo content — see
+      // claude.service.ts's docstring for why that was the wrong source.
+      // This depends on the answer actually being transcribed already —
+      // the /answers handler now transcribes synchronously on save
+      // specifically so this has real text to work with within the same
+      // still-open session, not just from past completed ones.
+      const priorAnswers = await trx("interview_answers as ia")
+        .join("interview_sessions as s", "s.id", "ia.session_id")
+        .join("interview_questions as q", "q.id", "ia.question_id")
+        .where({ "s.person_id": subjectPersonId })
+        .whereNotNull("ia.transcript")
+        .orderBy("ia.created_at", "desc")
+        .limit(8)
+        .select("ia.id", "q.text as question_text", "ia.transcript as answer_text");
+
+      if (priorAnswers.length === 0) {
+        // No transcribed answers to build on yet (either genuinely new, or
+        // transcription hasn't run — see docs/voice_pipeline.md section 1,
+        // which needs ELEVENLABS_API_KEY set). Nothing to return; the client
+        // falls back to the open-ended starting point instead.
+        return null;
+      }
+
+      const questionText = await generateFollowUpQuestion({
+        personName: person.name,
+        priorQAs: priorAnswers.map((a: { question_text: string; answer_text: string }) => ({
+          question: a.question_text,
+          answer: a.answer_text,
+        })),
+      });
+
+      const [generated] = await trx("interview_questions")
+        .insert({
+          text: questionText,
+          life_phase: "generated",
+          source: "generated",
+          person_id: subjectPersonId,
+          based_on_answer_ids: priorAnswers.map((a: { id: string }) => a.id),
+        })
+        .returning("*");
+      return generated;
+    });
+
+    if (!result) return res.status(204).send();
+    res.json(result);
+  } catch (err) {
+    // A missing/misconfigured ANTHROPIC_API_KEY shouldn't 500 the whole
+    // flow — surface it as a clear, catchable error so the client can fall
+    // back to "share a memory" instead of the screen breaking.
+    if (err instanceof Error && err.message.includes("ANTHROPIC_API_KEY")) {
+      return res.status(503).json({ error: err.message });
+    }
     next(err);
   }
 });
@@ -50,8 +154,8 @@ interviewsRouter.post("/interview-sessions/:id/answers", requireAuth, async (req
   try {
     const { personId, familyGroupId } = req.auth!;
     const { questionId, audioR2Key, photoIds } = req.body ?? {};
-    if (!questionId || !audioR2Key) {
-      return res.status(400).json({ error: "questionId and audioR2Key are required" });
+    if (!audioR2Key) {
+      return res.status(400).json({ error: "audioR2Key is required" });
     }
 
     const answer = await withRlsContext({ personId, familyGroupId }, async (trx) => {
@@ -59,8 +163,11 @@ interviewsRouter.post("/interview-sessions/:id/answers", requireAuth, async (req
       if (!session) throw new HttpError(404, "Interview session not found");
       if (session.status !== "in_progress") throw new HttpError(409, "This session is not in progress");
 
+      // questionId is optional — open-ended answers (mobile's "Share a
+      // memory" and "Start with a picture" starting points) have no
+      // specific question attached (see migration 021).
       const [row] = await trx("interview_answers")
-        .insert({ session_id: session.id, question_id: questionId, audio_r2_key: audioR2Key })
+        .insert({ session_id: session.id, question_id: questionId ?? null, audio_r2_key: audioR2Key })
         .returning("*");
 
       if (Array.isArray(photoIds) && photoIds.length > 0) {
@@ -70,30 +177,58 @@ interviewsRouter.post("/interview-sessions/:id/answers", requireAuth, async (req
       }
       return row;
     });
+
+    // Transcribe now, synchronously, rather than waiting for
+    // /complete — GET /interview-questions/next needs this answer's real
+    // text immediately to build the next adaptive follow-up within the
+    // same still-open session; queuing it for later meant every "next
+    // question" call during a live session only ever saw stale content
+    // from previous, already-completed sessions. Adds real latency to this
+    // request (a network round trip to ElevenLabs), which is an accepted
+    // trade for the session screen's existing "Saving…" state. Failure
+    // here (bad key, network blip) shouldn't lose the recording — the
+    // audio is already safely in R2 — so it's swallowed and left to the
+    // /complete handler's queue-based safety net below.
+    if (env.elevenlabsApiKey && env.r2.accountId) {
+      try {
+        await processTranscribeJob({ interviewAnswerId: answer.id });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`[interviews] synchronous transcription failed for answer ${answer.id}:`, err);
+      }
+    }
+    // Both unset just means transcription isn't configured yet at all (or
+    // this is a test run) — skip quietly rather than logging an error on
+    // every single answer for a known, already-surfaced-elsewhere gap.
+
     res.status(201).json(answer);
   } catch (err) {
     next(err);
   }
 });
 
-// Ends the session and enqueues one Q_TRANS job per answer — the worker (still
-// stubbed) calls Whisper, writes the transcript, creates the memories row
-// (provenance_type='voice'), and promotes any staged interview_answer_photos
-// into memory_photos. See docs/voice_pipeline.md section 1.
+// Ends the session. Most answers are already transcribed by now — the
+// /answers handler transcribes synchronously on save — this only enqueues a
+// Q_TRANS job for any that aren't (transcription failed there, or this
+// build still has ELEVENLABS_API_KEY unset and every answer is untranscribed),
+// as a safety net rather than the primary path. See docs/voice_pipeline.md
+// section 1.
 interviewsRouter.post("/interview-sessions/:id/complete", requireAuth, async (req: AuthedRequest, res, next) => {
   try {
     const { personId, familyGroupId } = req.auth!;
-    const answers = await withRlsContext({ personId, familyGroupId }, async (trx) => {
+    const untranscribedAnswers = await withRlsContext({ personId, familyGroupId }, async (trx) => {
       const session = await trx("interview_sessions").where({ id: req.params.id }).first();
       if (!session) throw new HttpError(404, "Interview session not found");
       if (session.status === "completed") throw new HttpError(409, "This session has already been completed");
 
       await trx("interview_sessions").where({ id: session.id }).update({ status: "completed", completed_at: new Date() });
-      return trx("interview_answers").where({ session_id: session.id });
+      return trx("interview_answers").where({ session_id: session.id }).whereNull("transcript");
     });
 
     await Promise.all(
-      answers.map((answer: { id: string }) => transcriptionQueue.add("transcribe", { interviewAnswerId: answer.id }))
+      untranscribedAnswers.map((answer: { id: string }) =>
+        transcriptionQueue.add("transcribe", { interviewAnswerId: answer.id })
+      )
     );
     res.status(204).send();
   } catch (err) {
