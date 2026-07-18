@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { withRlsContext } from "../db/pool";
-import { faceDetectionQueue, embeddingQueue } from "../jobs/queue";
+import { faceDetectionQueue, embeddingQueue, sceneClassificationQueue, photoClusteringQueue } from "../jobs/queue";
 import { HttpError } from "../utils/httpError";
 import { notImplemented } from "../utils/notImplemented";
 
@@ -9,11 +9,13 @@ export const collectionRouter = Router();
 const spec = "docs/section2_pipeline.md";
 
 // Device-side scan trigger pushes new photo hashes/metadata. This route's
-// job stops at registering the photos and queuing them for face detection —
-// the actual tier-1/2/3 branching (auto-submit to memories vs
-// proposed_memories vs discard) happens inside the Q_FACE worker itself once
-// a match comes back, per section 1 of the doc ("evaluated in the Q_FACE
-// worker itself... not deferred to the API layer").
+// job stops at registering the photos and queuing them for downstream
+// processing: face DETECTION only (no matching — see
+// docs/family_administrator_and_privacy_model.md section 5 and
+// docs/photo_pipeline_beta_architecture.md), two-stage scene classification,
+// and — once per sync batch, not once per photo — a re-run of the family's
+// time/location clustering pass, since a fresh batch of photos might extend
+// or form a new "outing" cluster.
 collectionRouter.post("/collection/camera-roll/sync", requireAuth, async (req: AuthedRequest, res, next) => {
   try {
     const { personId, familyGroupId } = req.auth!;
@@ -25,11 +27,14 @@ collectionRouter.post("/collection/camera-roll/sync", requireAuth, async (req: A
     const inserted = await withRlsContext({ personId, familyGroupId }, (trx) =>
       trx("photos")
         .insert(
-          photos.map((p: { r2Key: string; takenAt?: string }) => ({
+          photos.map((p: { r2Key: string; takenAt?: string; location?: { lat: number; lng: number } }) => ({
             family_group_id: familyGroupId,
             r2_key: p.r2Key,
             uploaded_by: personId,
             taken_at: p.takenAt ?? null,
+            // EXIF GPS, same "device extracted it, API just stores it"
+            // contract as takenAt — clustering's only consumer (section 6).
+            location: p.location ? JSON.stringify(p.location) : null,
             source: "camera_roll",
           }))
         )
@@ -43,6 +48,13 @@ collectionRouter.post("/collection/camera-roll/sync", requireAuth, async (req: A
     // "photos upload complete -> embed the image" trigger), independent of
     // whatever face-detection finds.
     await Promise.all(inserted.map((photo: { id: string }) => embeddingQueue.add("embed-photo", { photoId: photo.id })));
+    // Stage 1 of scene classification (docs/photo_pipeline_beta_architecture.md
+    // section 5) — stage 2 is enqueued by stage 1 itself, only for photos
+    // that pass triage, not from here.
+    await Promise.all(inserted.map((photo: { id: string }) => sceneClassificationQueue.add("classify", { photoId: photo.id })));
+    // Clustering (section 6) is a family-wide batch pass, not per-photo —
+    // one enqueue per sync call regardless of how many photos it contained.
+    await photoClusteringQueue.add("cluster", { familyGroupId });
     res.status(201).json({ items: inserted });
   } catch (err) {
     next(err);
@@ -62,7 +74,13 @@ collectionRouter.get("/collection/proposed", requireAuth, async (req: AuthedRequ
   }
 });
 
-// Two-tap accept: promotes the proposal into a real memory (photo provenance).
+// Two-tap accept: promotes the proposal into a real memory (photo
+// provenance), then attaches memory_photos for whichever source produced the
+// proposal — the single photo_id (classification) or every photo in
+// cluster_id's photo_cluster_photos (clustering) — per
+// docs/photo_pipeline_beta_architecture.md section 9. The resulting
+// memoryId is what tap-to-tag (POST /photos/:id/faces/:faceId/tag's
+// memoryId param) expects next, once the user says who's in it.
 collectionRouter.post("/collection/proposed/:id/accept", requireAuth, async (req: AuthedRequest, res, next) => {
   try {
     const { personId, familyGroupId } = req.auth!;
@@ -79,6 +97,14 @@ collectionRouter.post("/collection/proposed/:id/accept", requireAuth, async (req
           media_url: null,
         })
         .returning("id");
+
+      const photoIds = proposal.photo_id
+        ? [proposal.photo_id]
+        : (await trx("photo_cluster_photos").where({ cluster_id: proposal.cluster_id }).select("photo_id")).map(
+            (r: { photo_id: string }) => r.photo_id
+          );
+      await trx("memory_photos").insert(photoIds.map((photoId: string) => ({ memory_id: memory.id, photo_id: photoId })));
+
       await trx("proposed_memories").where({ id: proposal.id }).update({ status: "accepted" });
       return memory.id;
     });

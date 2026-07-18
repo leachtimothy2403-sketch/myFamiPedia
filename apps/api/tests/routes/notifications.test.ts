@@ -24,9 +24,15 @@ describe("notifications", () => {
   });
 
   it("gets and patches notification settings", async () => {
+    // GET merges a fixed list of notification types against whatever
+    // per-user override rows exist (notifications.routes.ts) — a user who's
+    // never touched their settings still gets the full list back, all
+    // defaulting to enabled: true, not an empty array.
     const getRes = await ctx.request().get("/api/v1/notifications/settings").set("Authorization", `Bearer ${user.accessToken}`);
     expect(getRes.status).toBe(200);
-    expect(getRes.body.items).toHaveLength(0);
+    expect(getRes.body.items.length).toBeGreaterThan(0);
+    expect(getRes.body.items.every((i: { enabled: boolean }) => i.enabled === true)).toBe(true);
+    const typeCount = getRes.body.items.length;
 
     const patchRes = await ctx
       .request()
@@ -44,8 +50,11 @@ describe("notifications", () => {
       .send({ notificationType: "manual_tier_nudge", enabled: true });
     expect(patchAgain.body.enabled).toBe(true);
 
+    // Still the same full merged list — one override doesn't shrink it.
     const finalGet = await ctx.request().get("/api/v1/notifications/settings").set("Authorization", `Bearer ${user.accessToken}`);
-    expect(finalGet.body.items).toHaveLength(1);
+    expect(finalGet.body.items).toHaveLength(typeCount);
+    const nudge = finalGet.body.items.find((i: { notificationType: string }) => i.notificationType === "manual_tier_nudge");
+    expect(nudge.enabled).toBe(true);
   });
 
   it("validates the settings patch body", async () => {

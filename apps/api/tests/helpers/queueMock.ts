@@ -26,6 +26,13 @@ export function mockQueues() {
     fakeQueues.embeddingQueue = fakeQueue();
     fakeQueues.notificationQueue = fakeQueue();
     fakeQueues.holdingSpaceQueue = fakeQueue();
+    fakeQueues.cronQueue = fakeQueue();
+    // docs/photo_pipeline_beta_architecture.md sections 5-6 — stage 1/2
+    // scene classification + batch clustering, enqueued from
+    // collection.routes.ts alongside the queues above.
+    fakeQueues.sceneClassificationQueue = fakeQueue();
+    fakeQueues.sceneClassificationReviewQueue = fakeQueue();
+    fakeQueues.photoClusteringQueue = fakeQueue();
     return { ...fakeQueues, connection: {} };
   });
 }

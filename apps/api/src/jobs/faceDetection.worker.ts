@@ -30,6 +30,11 @@ const defaultDeps: FaceDetectionDeps = { vision: defaultVisionService, getBytes:
 // commitFaceMatch.ts's tier-1/tier-2 branching are retired for the beta;
 // they're left in place, unused, pending the manual tap-to-tag replacement
 // (design doc sections 5-7) rather than deleted outright.
+// docs/photo_pipeline_beta_architecture.md section 1: detected boxes are now
+// persisted to photo_faces (geometry only, no identity) so the tap-to-tag UI
+// (photos.routes.ts) has something to fetch and render as tap targets, and
+// photos.face_count is denormalized alongside for the crowd-mode threshold
+// check (section 4) without needing a join on every photo read.
 export async function processDetectJob(data: DetectJobData, deps: FaceDetectionDeps = defaultDeps) {
   const { photoId } = data;
   const photo = await withServiceContext((trx) => trx("photos").where({ id: photoId }).first());
@@ -38,12 +43,27 @@ export async function processDetectJob(data: DetectJobData, deps: FaceDetectionD
   const imageBytes = await deps.getBytes(photo.r2_key);
   const faces = await deps.vision.detectFaces(imageBytes);
 
-  // Detected face regions are deliberately not persisted anywhere yet —
-  // they're only ever surfaced via this job's return value, for whatever
-  // calls this synchronously (the manual tap-to-tag UI flow, not yet built).
+  const faceIds = await withServiceContext(async (trx) => {
+    const rows =
+      faces.length > 0
+        ? await trx("photo_faces")
+            .insert(
+              faces.map((f) => ({
+                photo_id: photoId,
+                face_coordinates: JSON.stringify(f.boundingBox),
+                confidence: f.confidence,
+              }))
+            )
+            .returning("id")
+        : [];
+    await trx("photos").where({ id: photoId }).update({ face_count: faces.length });
+    return rows.map((r: { id: string }) => r.id);
+  });
+
   return {
     photoId,
     facesDetected: faces.length,
+    faceIds,
     matched: 0,
     unmatchedFaceCount: faces.length,
     createdMemories: [] as string[],

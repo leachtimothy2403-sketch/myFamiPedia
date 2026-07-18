@@ -16,6 +16,7 @@ import { moderationRouter } from "./routes/moderation.routes";
 import { subscriptionRouter } from "./routes/subscription.routes";
 import { notificationsRouter } from "./routes/notifications.routes";
 import { uploadsRouter } from "./routes/uploads.routes";
+import { photosRouter } from "./routes/photos.routes";
 
 const app = express();
 
@@ -38,6 +39,7 @@ v1.use(moderationRouter);
 v1.use(subscriptionRouter);
 v1.use(notificationsRouter);
 v1.use(uploadsRouter);
+v1.use(photosRouter);
 app.use("/api/v1", v1);
 
 app.use(errorHandler);

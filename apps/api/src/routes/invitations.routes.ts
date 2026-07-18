@@ -1,5 +1,6 @@
 import { Router } from "express";
 import crypto from "node:crypto";
+import type { Knex } from "knex";
 import { requireAuth, AuthedRequest, isFamilyAdministrator } from "../middleware/auth";
 import { withRlsContext, withTokenContext } from "../db/pool";
 import { holdingSpaceQueue, faceDetectionQueue } from "../jobs/queue";
@@ -8,6 +9,50 @@ import { HttpError } from "../utils/httpError";
 export const invitationsRouter = Router();
 
 const GRACE_PERIOD_DAYS = 90;
+
+// Shared by POST /invitations below and photos.routes.ts's proposal-approval
+// endpoint (docs/photo_pipeline_beta_architecture.md section 2 branch (c)) —
+// both need the exact same persons + relationships + invitations insert.
+// The caller is responsible for admin-gating (or not) before calling this;
+// this function itself performs no authorization checks, only the write.
+export async function createPersonInvitation(
+  trx: Knex.Transaction,
+  params: {
+    familyGroupId: string;
+    name: string;
+    relationshipType: string;
+    relatedToPersonId: string;
+    invitedByPersonId: string;
+    triggeringPhotoId?: string | null;
+    inviteeEmail?: string | null;
+    inviteePhone?: string | null;
+  }
+): Promise<{ person: Record<string, unknown>; invitation: Record<string, unknown>; token: string }> {
+  const token = crypto.randomBytes(24).toString("base64url");
+
+  const [person] = await trx("persons")
+    .insert({ family_group_id: params.familyGroupId, name: params.name, status: "invited_pending" })
+    .returning("*");
+
+  await trx("relationships").insert({
+    person_a_id: params.relatedToPersonId,
+    person_b_id: person.id,
+    relationship_type: params.relationshipType,
+  });
+
+  const [invitation] = await trx("invitations")
+    .insert({
+      person_id: person.id,
+      invited_by_person_id: params.invitedByPersonId,
+      token,
+      triggering_photo_id: params.triggeringPhotoId ?? null,
+      invitee_email: params.inviteeEmail ?? null,
+      invitee_phone: params.inviteePhone ?? null,
+    })
+    .returning("*");
+
+  return { person, invitation, token };
+}
 
 // Two entry points collapse to one handler: triggeringPhotoId set = someone
 // was tagged in a photo/memory; contact info given instead = manual "add
@@ -44,38 +89,24 @@ invitationsRouter.post("/invitations", requireAuth, async (req: AuthedRequest, r
       }
     }
 
-    const token = crypto.randomBytes(24).toString("base64url");
-
-    const result = await withRlsContext({ personId, familyGroupId }, async (trx) => {
-      const [person] = await trx("persons")
-        .insert({ family_group_id: familyGroupId, name, status: "invited_pending" })
-        .returning("*");
-
-      await trx("relationships").insert({
-        person_a_id: relatedToPersonId,
-        person_b_id: person.id,
-        relationship_type: relationshipType,
-      });
-
-      const [invitation] = await trx("invitations")
-        .insert({
-          person_id: person.id,
-          invited_by_person_id: personId,
-          token,
-          triggering_photo_id: triggeringPhotoId ?? null,
-          invitee_email: inviteeEmail ?? null,
-          invitee_phone: inviteePhone ?? null,
-        })
-        .returning("*");
-
-      return { person, invitation };
-    });
+    const result = await withRlsContext({ personId, familyGroupId }, (trx) =>
+      createPersonInvitation(trx, {
+        familyGroupId,
+        name,
+        relationshipType,
+        relatedToPersonId,
+        invitedByPersonId: personId,
+        triggeringPhotoId,
+        inviteeEmail,
+        inviteePhone,
+      })
+    );
 
     const needsShareableLink = !inviteeEmail && !inviteePhone;
     res.status(201).json({
       person: result.person,
       invitation: result.invitation,
-      shareableLink: needsShareableLink ? `https://app.myfamipedia.com/invite/${token}` : undefined,
+      shareableLink: needsShareableLink ? `https://app.myfamipedia.com/invite/${result.token}` : undefined,
     });
   } catch (err) {
     next(err);

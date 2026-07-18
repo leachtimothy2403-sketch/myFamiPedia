@@ -73,22 +73,52 @@ describe("face-detection worker", () => {
     expect(proposals).toHaveLength(0);
   });
 
-  it("reports detected faces in the return value without persisting anything", async () => {
+  it("persists detected faces to photo_faces and denormalizes photos.face_count", async () => {
     const { processDetectJob } = await import("../../src/jobs/faceDetection.worker");
     const { photo } = await seedFamily();
 
     const vision = fakeVision({
-      detectFaces: vi.fn(async () => [{ boundingBox: { width: 1, height: 1, left: 0, top: 0 }, confidence: 90 }]),
+      detectFaces: vi.fn(async () => [
+        { boundingBox: { width: 0.2, height: 0.3, left: 0.1, top: 0.1 }, confidence: 99 },
+        { boundingBox: { width: 0.2, height: 0.3, left: 0.5, top: 0.1 }, confidence: 90 },
+      ]),
     });
     const getBytes = vi.fn(async () => Buffer.from("fake-image-bytes"));
 
     const result = await processDetectJob({ photoId: photo.id }, { vision, getBytes });
 
-    expect(result.facesDetected).toBe(1);
+    expect(result.facesDetected).toBe(2);
+    expect(result.faceIds).toHaveLength(2);
     expect(result.matched).toBe(0);
-    expect(result.unmatchedFaceCount).toBe(1);
-    const photoPersons = await ctx.knex()("photo_persons").where({ photo_id: photo.id });
+    expect(result.unmatchedFaceCount).toBe(2);
+
+    const knex = ctx.knex();
+    const faceRows = await knex("photo_faces").where({ photo_id: photo.id }).orderBy("confidence", "desc");
+    expect(faceRows).toHaveLength(2);
+    expect(Number(faceRows[0].confidence)).toBe(99);
+    expect(faceRows[0].face_coordinates).toEqual({ width: 0.2, height: 0.3, left: 0.1, top: 0.1 });
+
+    const updatedPhoto = await knex("photos").where({ id: photo.id }).first();
+    expect(updatedPhoto.face_count).toBe(2);
+
+    const photoPersons = await knex("photo_persons").where({ photo_id: photo.id });
     expect(photoPersons).toHaveLength(0);
+  });
+
+  it("sets face_count to 0 and writes no rows when no faces are detected", async () => {
+    const { processDetectJob } = await import("../../src/jobs/faceDetection.worker");
+    const { photo } = await seedFamily();
+
+    const vision = fakeVision({ detectFaces: vi.fn(async () => []) });
+    const getBytes = vi.fn(async () => Buffer.from("fake-image-bytes"));
+
+    const result = await processDetectJob({ photoId: photo.id }, { vision, getBytes });
+
+    expect(result.facesDetected).toBe(0);
+    expect(result.faceIds).toHaveLength(0);
+    const knex = ctx.knex();
+    expect((await knex("photo_faces").where({ photo_id: photo.id })).length).toBe(0);
+    expect((await knex("photos").where({ id: photo.id }).first()).face_count).toBe(0);
   });
 
   it("remove-from-collection calls deleteFaces against the person's family collection", async () => {

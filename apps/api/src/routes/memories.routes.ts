@@ -45,9 +45,35 @@ memoriesRouter.post("/memories", requireAuth, async (req: AuthedRequest, res, ne
 
       const taggedPersonIds: string[] = Array.isArray(personIds) ? personIds : [];
       if (taggedPersonIds.length) {
-        await trx("memory_persons").insert(
-          taggedPersonIds.map((pid) => ({ memory_id: created.id, person_id: pid }))
-        );
+        const taggedPersons = await trx("persons").whereIn("id", taggedPersonIds).select("id", "status");
+        const activeIds = taggedPersons.filter((p: { status: string }) => p.status === "active").map((p: { id: string }) => p.id);
+        const pendingPersons = taggedPersons.filter((p: { status: string }) => p.status === "invited_pending");
+
+        if (activeIds.length) {
+          await trx("memory_persons").insert(activeIds.map((pid: string) => ({ memory_id: created.id, person_id: pid })));
+        }
+
+        // docs/family_administrator_and_privacy_model.md section 3, "Bug
+        // identified, not yet fixed": a text-tagged still-pending person used
+        // to write straight to memory_persons and show live on their profile
+        // immediately, despite their invitation being pending — the Juliette
+        // case. Fixed here: per-tag, not per-memory (section 3's principle) —
+        // a memory tagging both an active and a pending person still shows
+        // normally for the active one; only the pending person's specific tag
+        // is held, mirroring what photo-tagging already does via
+        // holding_space (photos.routes.ts). Promoted on acceptance by
+        // holdingSpaceDrain.worker.ts's media_type === 'mention' branch.
+        for (const p of pendingPersons) {
+          await trx("holding_space").insert({
+            person_id: p.id,
+            source_person_id: personId,
+            media_type: "mention",
+            raw_metadata: JSON.stringify({ memoryId: created.id }),
+          });
+        }
+        // Any other status (declined_grace, opted_out, deceased, or a bad id
+        // not found at all) is neither tagged nor held — same as this
+        // endpoint's prior behavior of not validating tagged ids' existence.
       }
       if (Array.isArray(photoIds) && photoIds.length) {
         await trx("memory_photos").insert(

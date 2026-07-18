@@ -13,17 +13,28 @@ describe("collection", () => {
   });
 
   describe("camera-roll sync", () => {
-    it("registers photos and enqueues face detection", async () => {
+    it("registers photos and enqueues face detection, scene classification, and one clustering pass per sync", async () => {
       const res = await ctx
         .request()
         .post("/api/v1/collection/camera-roll/sync")
         .set("Authorization", `Bearer ${user.accessToken}`)
-        .send({ photos: [{ r2Key: "a.jpg" }, { r2Key: "b.jpg", takenAt: "2024-01-01T00:00:00.000Z" }] });
+        .send({
+          photos: [
+            { r2Key: "a.jpg" },
+            { r2Key: "b.jpg", takenAt: "2024-01-01T00:00:00.000Z", location: { lat: 48.8, lng: 2.3 } },
+          ],
+        });
       expect(res.status).toBe(201);
       expect(res.body.items).toHaveLength(2);
       expect(res.body.items[0].source).toBe("camera_roll");
+      expect(res.body.items[1].location).toEqual({ lat: 48.8, lng: 2.3 });
 
       expect(getQueueMock("faceDetectionQueue").add).toHaveBeenCalledTimes(2);
+      // Per-photo (docs/photo_pipeline_beta_architecture.md section 5).
+      expect(getQueueMock("sceneClassificationQueue").add).toHaveBeenCalledTimes(2);
+      // Once per sync batch, not once per photo (section 6).
+      expect(getQueueMock("photoClusteringQueue").add).toHaveBeenCalledTimes(1);
+      expect(getQueueMock("photoClusteringQueue").add).toHaveBeenCalledWith("cluster", { familyGroupId: user.familyGroupId });
     });
 
     it("requires a non-empty photos array", async () => {
@@ -37,15 +48,32 @@ describe("collection", () => {
   });
 
   describe("proposed memories review queue", () => {
-    async function createProposal() {
-      const [proposal] = await ctx.knex()("proposed_memories").insert({ person_id: user.personId, status: "pending" }).returning("*");
+    // proposed_memories now requires exactly one of photo_id/cluster_id
+    // (migration 024's source-check constraint,
+    // docs/photo_pipeline_beta_architecture.md section 9) — a bare proposal
+    // with neither set is no longer a valid row, so every helper here seeds
+    // a real photo (and, for the cluster case, a real cluster) first.
+    async function seedPhoto() {
+      const [photo] = await ctx
+        .knex()("photos")
+        .insert({ family_group_id: user.familyGroupId, r2_key: "p.jpg", uploaded_by: user.personId })
+        .returning("*");
+      return photo;
+    }
+
+    async function createProposal(personId: string = user.personId) {
+      const photo = await seedPhoto();
+      const [proposal] = await ctx
+        .knex()("proposed_memories")
+        .insert({ person_id: personId, status: "pending", photo_id: photo.id })
+        .returning("*");
       return proposal;
     }
 
     it("lists only this person's pending proposals", async () => {
       await createProposal();
       const other = await registerTestUser(ctx.request);
-      await ctx.knex()("proposed_memories").insert({ person_id: other.personId, status: "pending" });
+      await createProposal(other.personId);
 
       const res = await ctx
         .request()
@@ -55,7 +83,7 @@ describe("collection", () => {
       expect(res.body.items).toHaveLength(1);
     });
 
-    it("accept promotes the proposal to a real memory", async () => {
+    it("accept promotes a photo-sourced proposal to a real memory with its photo attached", async () => {
       const proposal = await createProposal();
       const res = await ctx
         .request()
@@ -68,6 +96,33 @@ describe("collection", () => {
       const memories = await ctx.knex()("memories").where({ contributor_id: user.personId });
       expect(memories).toHaveLength(1);
       expect(memories[0].provenance_type).toBe("photo");
+      const memoryPhotos = await ctx.knex()("memory_photos").where({ memory_id: memories[0].id });
+      expect(memoryPhotos).toHaveLength(1);
+      expect(memoryPhotos[0].photo_id).toBe(proposal.photo_id);
+    });
+
+    it("accept promotes a cluster-sourced proposal, attaching every photo in the cluster", async () => {
+      const [photoA, photoB] = await Promise.all([seedPhoto(), seedPhoto()]);
+      const [cluster] = await ctx.knex()("photo_clusters").insert({ family_group_id: user.familyGroupId }).returning("*");
+      await ctx.knex()("photo_cluster_photos").insert([
+        { cluster_id: cluster.id, photo_id: photoA.id },
+        { cluster_id: cluster.id, photo_id: photoB.id },
+      ]);
+      const [proposal] = await ctx
+        .knex()("proposed_memories")
+        .insert({ person_id: user.personId, status: "pending", cluster_id: cluster.id })
+        .returning("*");
+
+      const res = await ctx
+        .request()
+        .post(`/api/v1/collection/proposed/${proposal.id}/accept`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(204);
+
+      const memories = await ctx.knex()("memories").where({ contributor_id: user.personId });
+      expect(memories).toHaveLength(1);
+      const memoryPhotos = await ctx.knex()("memory_photos").where({ memory_id: memories[0].id });
+      expect(memoryPhotos.map((mp: { photo_id: string }) => mp.photo_id).sort()).toEqual([photoA.id, photoB.id].sort());
     });
 
     it("reject soft-deletes without creating a memory", async () => {

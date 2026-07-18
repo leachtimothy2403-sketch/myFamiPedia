@@ -152,11 +152,15 @@ describe("scheduled jobs (Q_CRON daily sweep)", () => {
       const [person] = await knex("persons")
         .insert({ family_group_id: group.id, name: "Tier2", status: "active", privacy_tier: 2 })
         .returning("*");
-      await knex("proposed_memories").insert([
-        { person_id: person.id, status: "pending" },
-        { person_id: person.id, status: "pending" },
-        { person_id: person.id, status: "pending" },
-      ]);
+      // proposed_memories requires exactly one of photo_id/cluster_id
+      // (migration 024's source-check constraint) — three distinct photos
+      // stand in for three distinct candidates here.
+      const photos = await knex("photos")
+        .insert([1, 2, 3].map((n) => ({ family_group_id: group.id, r2_key: `p${n}.jpg`, uploaded_by: person.id })))
+        .returning("*");
+      await knex("proposed_memories").insert(
+        photos.map((p: { id: string }) => ({ person_id: person.id, status: "pending", photo_id: p.id }))
+      );
 
       const result = await sweepReviewCardCadence(fixedDeps);
       expect(result.notified).toBe(1);
@@ -181,11 +185,12 @@ describe("scheduled jobs (Q_CRON daily sweep)", () => {
           last_review_notification_at: new Date(FIXED_NOW.getTime() - 1 * DAY_MS),
         })
         .returning("*");
-      await knex("proposed_memories").insert([
-        { person_id: person.id, status: "pending" },
-        { person_id: person.id, status: "pending" },
-        { person_id: person.id, status: "pending" },
-      ]);
+      const photos = await knex("photos")
+        .insert([1, 2, 3].map((n) => ({ family_group_id: group.id, r2_key: `p${n}.jpg`, uploaded_by: person.id })))
+        .returning("*");
+      await knex("proposed_memories").insert(
+        photos.map((p: { id: string }) => ({ person_id: person.id, status: "pending", photo_id: p.id }))
+      );
 
       const result = await sweepReviewCardCadence(fixedDeps);
       expect(result.notified).toBe(0);

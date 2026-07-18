@@ -21,3 +21,14 @@ export const holdingSpaceQueue = new Queue("holding-space-drain", { connection }
 // a separate cron library — "no need for a second scheduler" per the doc,
 // and BullMQ/Redis is already a hard dependency everywhere else here.
 export const cronQueue = new Queue("cron", { connection });
+
+// docs/photo_pipeline_beta_architecture.md section 5 — two-stage scene
+// classification, deliberately two separate queues so the expensive stage 2
+// (Claude Haiku) calls can be rate-limited/scaled independently from stage
+// 1's cheap, every-photo Rekognition DetectLabels triage.
+export const sceneClassificationQueue = new Queue("scene-classification", { connection });
+export const sceneClassificationReviewQueue = new Queue("scene-classification-review", { connection });
+// docs/photo_pipeline_beta_architecture.md section 6 — batch clustering,
+// triggered after each camera-roll sync rather than only via Q_CRON (pure
+// metadata arithmetic, cheap enough to run more often than daily).
+export const photoClusteringQueue = new Queue("photo-clustering", { connection });

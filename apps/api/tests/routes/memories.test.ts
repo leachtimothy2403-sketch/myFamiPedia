@@ -222,4 +222,58 @@ describe("memories", () => {
       expect(res.status).toBe(409);
     });
   });
+
+  // docs/family_administrator_and_privacy_model.md section 3 — the Juliette
+  // bug: a memory tagging both an active and a still-pending person used to
+  // show live on the pending person's profile immediately. Fixed per-tag,
+  // not per-memory.
+  describe("POST /memories — tagging a still-pending person", () => {
+    it("tags the active person directly but holds the pending person's tag instead of writing memory_persons", async () => {
+      const [activePerson] = await ctx
+        .knex()("persons")
+        .insert({ family_group_id: user.familyGroupId, name: "Active Cousin", status: "active" })
+        .returning("*");
+      const [pendingPerson] = await ctx
+        .knex()("persons")
+        .insert({ family_group_id: user.familyGroupId, name: "Pending Cousin", status: "invited_pending" })
+        .returning("*");
+
+      const res = await ctx
+        .request()
+        .post("/api/v1/memories")
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ content: "A story about both of you", personIds: [activePerson.id, pendingPerson.id] });
+      expect(res.status).toBe(201);
+
+      const memoryPersons = await ctx.knex()("memory_persons").where({ memory_id: res.body.id });
+      expect(memoryPersons.map((mp: { person_id: string }) => mp.person_id)).toEqual([activePerson.id]);
+
+      const held = await ctx.knex()("holding_space").where({ person_id: pendingPerson.id }).first();
+      expect(held).toBeDefined();
+      expect(held.media_type).toBe("mention");
+      expect(held.raw_metadata.memoryId).toBe(res.body.id);
+    });
+
+    it("promotes the held mention into memory_persons once the pending person is drained", async () => {
+      const [pendingPerson] = await ctx
+        .knex()("persons")
+        .insert({ family_group_id: user.familyGroupId, name: "Pending Cousin", status: "invited_pending" })
+        .returning("*");
+      const res = await ctx
+        .request()
+        .post("/api/v1/memories")
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ content: "About the pending cousin", personIds: [pendingPerson.id] });
+      expect(res.status).toBe(201);
+
+      const { processDrainJob } = await import("../../src/jobs/holdingSpaceDrain.worker");
+      const result = await processDrainJob({ personId: pendingPerson.id });
+      expect(result.mentionsPromoted).toBe(1);
+
+      const memoryPersons = await ctx.knex()("memory_persons").where({ memory_id: res.body.id, person_id: pendingPerson.id });
+      expect(memoryPersons).toHaveLength(1);
+      const held = await ctx.knex()("holding_space").where({ person_id: pendingPerson.id }).first();
+      expect(held.archived_at).not.toBeNull();
+    });
+  });
 });

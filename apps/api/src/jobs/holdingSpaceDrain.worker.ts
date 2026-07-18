@@ -1,41 +1,23 @@
 import { Worker, Job } from "bullmq";
 import { connection } from "./queue";
 import { withServiceContext } from "../db/pool";
-import { getObjectBuffer } from "../services/r2.service";
-import { visionService as defaultVisionService, VisionService } from "../services/vision.service";
 
 export interface DrainJobData {
   personId: string;
 }
 
-export interface HoldingSpaceDrainDeps {
-  vision: VisionService;
-  getBytes: (r2Key: string) => Promise<Buffer>;
-}
-
-const defaultDeps: HoldingSpaceDrainDeps = { vision: defaultVisionService, getBytes: getObjectBuffer };
-
-// AUTOMATED MATCHING DISABLED (2026-07-18) — see
-// docs/family_administrator_and_privacy_model.md section 5. This worker's
-// original design enrolled a biometric face template from the person's own
-// holding-space photos (IndexFaces) and retroactively ran SearchFacesByImage
-// against the whole family's photo library — real GDPR Article 9 exposure,
-// not cleared by counsel, disabled at the worker level so it can't go live
-// just because someone wires up real AWS credentials later.
-//
-// KNOWN GAP, not silently papered over: this was the *only* mechanism that
-// surfaced a photo-tag's content once the tagged person accepted their
-// invitation (docs/media_pipeline.md section 3, "profile populates rapidly
-// on acceptance"). Without matching, there's no way yet to know which of the
-// family's other photos this person appears in, and the originally-tagged
-// holding_space photo itself was only ever going to be found again by that
-// same retroactive scan. So: holding_space rows are deliberately left
-// un-archived here (not drained, not discarded) rather than marking them
-// processed and losing the content. This needs a real replacement — probably
-// draining each holding_space photo directly into a manual tap-to-tag review
-// card for the newly-active person, rather than relying on rediscovery via
-// matching — as part of the photo-pipeline rebuild (design doc sections 5-7).
-export async function processDrainJob(data: DrainJobData, deps: HoldingSpaceDrainDeps = defaultDeps) {
+// docs/photo_pipeline_beta_architecture.md section 10 — the redesign that
+// replaces today's (2026-07-18) stopgap, which left holding_space rows
+// un-archived because the old drain mechanism (biometric enrollment +
+// retroactive re-scan) was disabled outright. That retroactive rediscovery
+// turns out not to be needed: every holding_space row written by the
+// current tap-to-tag flow (photos.routes.ts branch (b), and the
+// proposal-approval endpoint) already carries the exact photoId/faceId/
+// faceCoordinates it needs in raw_metadata, because a human supplied them
+// at tag time — there's nothing left to "discover." Draining is now a
+// straight promotion: no matching, no re-scan, no vision service involved
+// at all.
+export async function processDrainJob(data: DrainJobData) {
   const { personId } = data;
   const person = await withServiceContext((trx) => trx("persons").where({ id: personId }).first());
   if (!person) throw new Error(`Person ${personId} not found`);
@@ -44,7 +26,68 @@ export async function processDrainJob(data: DrainJobData, deps: HoldingSpaceDrai
     trx("holding_space").where({ person_id: personId }).whereNull("archived_at")
   );
 
-  return { personId, enrolledFromHoldingSpace: 0, newlyMatchedPhotoIds: [] as string[], pendingHoldingSpaceRows: holdingRows.length };
+  let photosPromoted = 0;
+  let mentionsPromoted = 0;
+
+  for (const row of holdingRows) {
+    const meta = (row.raw_metadata ?? {}) as {
+      photoId?: string;
+      faceId?: string;
+      faceCoordinates?: unknown;
+      memoryId?: string;
+    };
+
+    if (row.media_type === "photo" && meta.photoId && meta.faceId) {
+      await withServiceContext(async (trx) => {
+        await trx("photo_persons")
+          .insert({
+            photo_id: meta.photoId,
+            person_id: personId,
+            face_coordinates: JSON.stringify(meta.faceCoordinates ?? null),
+            identification_status: "confirmed",
+            face_id: meta.faceId,
+            tagged_by: row.source_person_id,
+          })
+          .onConflict(["photo_id", "person_id"])
+          .ignore();
+
+        if (meta.memoryId) {
+          const memory = await trx("memories").where({ id: meta.memoryId }).first();
+          if (memory) {
+            await trx("memory_persons")
+              .insert({ memory_id: meta.memoryId, person_id: personId })
+              .onConflict(["memory_id", "person_id"])
+              .ignore();
+            await trx("memory_photos")
+              .insert({ memory_id: meta.memoryId, photo_id: meta.photoId })
+              .onConflict(["memory_id", "photo_id"])
+              .ignore();
+          }
+        }
+      });
+      photosPromoted++;
+    } else if (row.media_type === "mention" && meta.memoryId) {
+      await withServiceContext(async (trx) => {
+        const memory = await trx("memories").where({ id: meta.memoryId }).first();
+        if (memory) {
+          await trx("memory_persons")
+            .insert({ memory_id: meta.memoryId, person_id: personId })
+            .onConflict(["memory_id", "person_id"])
+            .ignore();
+        }
+      });
+      mentionsPromoted++;
+    }
+    // media_type === 'voice' (or a photo/mention row missing the metadata a
+    // human tag should always have supplied) has no promotion step defined
+    // here — archived below for provenance like everything else, but not
+    // acted on. Voice-consent holding is a separate concern from this
+    // pipeline; see docs/media_pipeline.md.
+
+    await withServiceContext((trx) => trx("holding_space").where({ id: row.id }).update({ archived_at: new Date() }));
+  }
+
+  return { personId, photosPromoted, mentionsPromoted, archived: holdingRows.length };
 }
 
 export const holdingSpaceDrainWorker = new Worker(
