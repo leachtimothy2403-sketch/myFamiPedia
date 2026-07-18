@@ -3,14 +3,11 @@ import { withDb } from "../helpers/withDb";
 import { mockQueues } from "../helpers/queueMock";
 
 mockQueues();
-import type { VisionService, FaceBox, FaceMatch } from "../../src/services/vision.service";
+import type { VisionService, FaceBox } from "../../src/services/vision.service";
 
 function fakeVision(overrides: Partial<VisionService> = {}): VisionService {
   return {
-    ensureCollection: vi.fn(async () => {}),
     detectFaces: vi.fn(async (): Promise<FaceBox[]> => []),
-    searchFacesByImage: vi.fn(async (): Promise<FaceMatch[]> => []),
-    indexFace: vi.fn(async () => {}),
     deleteFaces: vi.fn(async () => {}),
     ...overrides,
   };
@@ -39,26 +36,26 @@ describe("face-detection worker", () => {
 
   // Automated matching is disabled (see the worker's header comment and
   // docs/family_administrator_and_privacy_model.md section 5) — detection
-  // never triggers a search, so no memory or proposal gets auto-created
-  // regardless of the matched persons' privacy_tier. These tests assert the
-  // worker doesn't even attempt to call searchFacesByImage anymore.
-  it("only detects faces — does not search, match, or write anything, even with matching persons in the family", async () => {
+  // never triggers a search or write, regardless of the matched persons'
+  // privacy_tier. The VisionService interface itself no longer even exposes
+  // a search/match method (trimmed to detectFaces + deleteFaces,
+  // docs/photo_pipeline_beta_architecture.md's flagged cleanup) — that's a
+  // stronger guarantee than a runtime "not called" assertion, so this test
+  // now only asserts the write-side of "detection isn't identification."
+  it("only detects faces — writes nothing to photo_persons, memories, or proposed_memories, even with active persons in the family", async () => {
     const { processDetectJob } = await import("../../src/jobs/faceDetection.worker");
     const { photo } = await seedFamily();
 
-    const searchFacesByImage = vi.fn(async (): Promise<FaceMatch[]> => []);
     const vision = fakeVision({
       detectFaces: vi.fn(async () => [
         { boundingBox: { width: 1, height: 1, left: 0, top: 0 }, confidence: 99 },
         { boundingBox: { width: 1, height: 1, left: 0, top: 0 }, confidence: 98 },
       ]),
-      searchFacesByImage,
     });
     const getBytes = vi.fn(async () => Buffer.from("fake-image-bytes"));
 
     const result = await processDetectJob({ photoId: photo.id }, { vision, getBytes });
 
-    expect(searchFacesByImage).not.toHaveBeenCalled();
     expect(result.matched).toBe(0);
     expect(result.unmatchedFaceCount).toBe(2);
     expect(result.createdMemories).toHaveLength(0);

@@ -4,15 +4,13 @@ Builds on the media pipeline (photo/face detection) and voice pipeline (transcri
 
 ## 1. Camera roll stream — privacy tier branching
 
-After `Q_FACE` produces a match (see media pipeline doc), routing depends on `persons.privacy_tier` for the **profile owner being matched**, not the uploader:
+**2026-07-18 rewrite.** This section originally described `persons.privacy_tier` branching whether a face-*match* auto-submitted to `memories`, went to `proposed_memories` for review, or was discarded. That behavior is gone along with automated matching itself (`docs/media_pipeline.md`, `docs/photo_pipeline_beta_architecture.md`) — there's no more "a match came back" moment for a tier to branch on.
 
-| Tier | Behavior |
-|---|---|
-| 1 — collect everything, auto-submit | Match writes directly to `memories` (provenance `photo`), no review step. |
-| 2 — collect, review before submit | Match writes to `proposed_memories` (`status='pending'`). Surfaces in the weekly/daily review card. |
-| 3 — manual only | Match is discarded from auto-pipeline entirely (or held ephemerally for 24h in case tier changes); user must manually add via the standard "add memory" flow. |
+What actually produces a `proposed_memories` row today is the two-stage scene classification pipeline and the time/location clustering job (architecture doc sections 5-6), and **neither currently reads `privacy_tier` at all.** Every candidate they surface goes to `proposed_memories` and into the person's review-card queue, regardless of tier. In practice this means:
 
-This branch is evaluated in the `Q_FACE` worker itself (reads `persons.privacy_tier` before deciding whether to write `memories` vs `proposed_memories` vs nothing), not deferred to the API layer — keeps the rule enforced in one place regardless of which client calls it.
+- **Tier 2** still does something real and unchanged: `sweepReviewCardCadence` (`scheduledJobs.worker.ts`) notifies tier-2 people once they have ≥3 pending `proposed_memories` — that part of the pipeline never depended on *how* the candidate was produced, only on the pending count, so it kept working correctly through the matching→classification swap without any code change.
+- **Tier 3** still does something real and unchanged too: `sweepManualTierNudges` nudges tier-3 people who haven't manually added anything in 14-21 days — again independent of how candidates get created.
+- **Tier 1** currently has no distinct live behavior left. It used to mean "skip review entirely, auto-submit" — that's not possible anymore since nothing auto-submits without a human tap. Selecting tier 1 today is indistinguishable in practice from not being tier 2 or tier 3. This is an honest inconsistency, not a design decision — `docs/family_administrator_and_privacy_model.md` section 7 has a proposed redefinition (two tiers instead of three, governing the trust-list tag-review window rather than photo auto-submission) but that redefinition isn't built yet, and the API still validates `privacyTier` as `1 | 2 | 3` (`collection.routes.ts`). Worth resolving — either build the redefinition or explicitly retire tier 1 — rather than leaving a selectable setting that does nothing.
 
 ## 2. Review card cadence
 

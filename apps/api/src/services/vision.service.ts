@@ -1,69 +1,92 @@
-// Face detection / recognition — AWS Rekognition (or GCP Vision) collection-based
-// matching. See docs/media_pipeline.md section 2 for the full worker contract
-// this interface exists to support, and section 4/5 for the collection-scope
-// privacy rule this is built around: only `persons.status = 'active'` members
-// are ever indexed (ExternalImageId = person.id), so a "match" always resolves
-// straight to a person row with zero extra lookup tables needed.
+// Face detection — AWS Rekognition. See docs/media_pipeline.md section 2 for
+// the full worker contract this interface exists to support.
 //
-// Real implementation needs @aws-sdk/client-rekognition (SigV4-signed calls,
-// not plain REST — deliberately not hand-rolled here) and R2/S3 object bytes
-// (see r2.service.ts's getObjectBuffer, itself not yet implemented for the
-// same reason: needs @aws-sdk/client-s3 wired against real R2 credentials).
-// Every method below throws until that dependency is added; the workers that
-// call this are fully implemented and tested against a fake VisionService —
-// only this boundary is a stub.
+// Automated face MATCHING (SearchFacesByImage/IndexFaces/collection
+// enrollment) is permanently retired for this product — see
+// docs/family_administrator_and_privacy_model.md section 5 (running
+// biometric identification against family members, including bystanders who
+// never consented, is GDPR Article 9 exposure that hasn't been cleared by
+// counsel). This interface only covers what's actually still called:
+// `detectFaces` (geometry only, no identity — not biometric identification
+// data, no Article 9 exposure) for tap-to-tag, and `deleteFaces` for purging
+// any legacy collection entries left over from before 2026-07-18, when
+// matching was live and did enroll faces. `searchFacesByImage`, `indexFace`,
+// and `ensureCollection` were trimmed from this interface —
+// docs/photo_pipeline_beta_architecture.md already flagged them as dead code
+// nothing calls anymore under the current design.
+import { DetectFacesCommand, ListFacesCommand, DeleteFacesCommand } from "@aws-sdk/client-rekognition";
+import { getRekognitionClient } from "./rekognitionClient";
 
 export interface FaceBox {
   boundingBox: { width: number; height: number; left: number; top: number };
   confidence: number;
 }
 
-export interface FaceMatch {
-  externalImageId: string; // == persons.id, by convention (see module doc comment)
-  similarity: number; // 0-100, Rekognition's convention
-}
-
 export interface VisionService {
   /** DetectFaces — bounding boxes only, no identity. */
   detectFaces(imageBytes: Buffer): Promise<FaceBox[]>;
-  /** SearchFacesByImage against the family group's collection. */
-  searchFacesByImage(collectionId: string, imageBytes: Buffer): Promise<FaceMatch[]>;
-  /** IndexFaces — enrolls a face into the collection under externalImageId (== person id). */
-  indexFace(collectionId: string, imageBytes: Buffer, externalImageId: string): Promise<void>;
-  /** Removes all faces enrolled under externalImageId from the collection (opt-out / decline expiry). */
+  /**
+   * Removes all faces enrolled under externalImageId (== person id) from the
+   * collection, if any exist. Safe to call against a family that never had a
+   * collection at all (any family created after matching was retired,
+   * 2026-07-18) — a missing collection is treated as "nothing to delete,"
+   * not an error, since that's the expected, common case going forward.
+   */
   deleteFaces(collectionId: string, externalImageId: string): Promise<void>;
-  /** Creates the per-family-group collection if it doesn't already exist. Idempotent. */
-  ensureCollection(collectionId: string): Promise<void>;
 }
 
-class NotConfiguredVisionService implements VisionService {
-  private fail(op: string): never {
-    throw new Error(
-      `VisionService.${op} is not implemented — wire up @aws-sdk/client-rekognition ` +
-        `(CreateCollection/DetectFaces/SearchFacesByImage/IndexFaces/DeleteFaces) against ` +
-        `real AWS credentials. See docs/media_pipeline.md section 2.`
-    );
+function isResourceNotFound(err: unknown): boolean {
+  return err instanceof Error && err.name === "ResourceNotFoundException";
+}
+
+class RekognitionVisionService implements VisionService {
+  async detectFaces(imageBytes: Buffer): Promise<FaceBox[]> {
+    const res = await getRekognitionClient().send(new DetectFacesCommand({ Image: { Bytes: imageBytes } }));
+    return (res.FaceDetails ?? [])
+      .filter((f) => f.BoundingBox)
+      .map((f) => ({
+        boundingBox: {
+          width: f.BoundingBox!.Width ?? 0,
+          height: f.BoundingBox!.Height ?? 0,
+          left: f.BoundingBox!.Left ?? 0,
+          top: f.BoundingBox!.Top ?? 0,
+        },
+        confidence: f.Confidence ?? 0,
+      }));
   }
-  detectFaces(): Promise<FaceBox[]> {
-    this.fail("detectFaces");
-  }
-  searchFacesByImage(): Promise<FaceMatch[]> {
-    this.fail("searchFacesByImage");
-  }
-  indexFace(): Promise<void> {
-    this.fail("indexFace");
-  }
-  deleteFaces(): Promise<void> {
-    this.fail("deleteFaces");
-  }
-  ensureCollection(): Promise<void> {
-    this.fail("ensureCollection");
+
+  async deleteFaces(collectionId: string, externalImageId: string): Promise<void> {
+    // Rekognition's DeleteFaces takes FaceIds, not an ExternalImageId filter
+    // — ListFaces (paginated) is the only way to resolve one to the other.
+    const faceIds: string[] = [];
+    let nextToken: string | undefined;
+    try {
+      do {
+        const res = await getRekognitionClient().send(
+          new ListFacesCommand({ CollectionId: collectionId, NextToken: nextToken, MaxResults: 100 })
+        );
+        for (const face of res.Faces ?? []) {
+          if (face.ExternalImageId === externalImageId && face.FaceId) faceIds.push(face.FaceId);
+        }
+        nextToken = res.NextToken;
+      } while (nextToken);
+    } catch (err) {
+      if (isResourceNotFound(err)) return; // no collection ever existed for this family — nothing to clean up
+      throw err;
+    }
+
+    if (faceIds.length === 0) return;
+    await getRekognitionClient().send(new DeleteFacesCommand({ CollectionId: collectionId, FaceIds: faceIds }));
   }
 }
 
-export const visionService: VisionService = new NotConfiguredVisionService();
+export const visionService: VisionService = new RekognitionVisionService();
 
-/** Family groups map 1:1 to Rekognition collections; this is the naming convention, not a lookup. */
+/**
+ * Family groups map 1:1 to Rekognition collections; this is the naming
+ * convention, not a lookup. Only meaningful for legacy (pre-2026-07-18)
+ * collections now — see `deleteFaces` above.
+ */
 export function collectionIdFor(familyGroupId: string): string {
   return `myfamipedia-${familyGroupId}`;
 }
