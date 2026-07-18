@@ -1,6 +1,6 @@
 import { Router } from "express";
 import crypto from "node:crypto";
-import { requireAuth, AuthedRequest } from "../middleware/auth";
+import { requireAuth, AuthedRequest, isFamilyAdministrator } from "../middleware/auth";
 import { withRlsContext, withTokenContext } from "../db/pool";
 import { holdingSpaceQueue, faceDetectionQueue } from "../jobs/queue";
 import { HttpError } from "../utils/httpError";
@@ -16,6 +16,16 @@ const GRACE_PERIOD_DAYS = 90;
 // docs/data_model.md's "Adding a family member — living vs. deceased branch".
 // Neither email nor phone given -> returns a shareable link for the inviter
 // to send themselves (documented MVP fallback, no contact-lookup service).
+//
+// Admin gate applies to the MANUAL path only (!triggeringPhotoId) — per
+// docs/family_administrator_and_privacy_model.md section 2's "consequential
+// act" principle, tapping "add family member" from the tree is
+// administrator-only, while recognizing a face in a photo stays open to any
+// family member (that's the whole point of section 2's photo-tag branch —
+// an admin isn't necessarily who'll recognize a cousin's college roommate).
+// This can't be a blanket route-level middleware since the same handler
+// serves both paths with different gating; checked inline instead, against
+// the same isFamilyAdministrator helper requireFamilyAdministrator uses.
 invitationsRouter.post("/invitations", requireAuth, async (req: AuthedRequest, res, next) => {
   try {
     const { personId, familyGroupId } = req.auth!;
@@ -23,6 +33,15 @@ invitationsRouter.post("/invitations", requireAuth, async (req: AuthedRequest, r
       req.body ?? {};
     if (!name || !relationshipType || !relatedToPersonId) {
       return res.status(400).json({ error: "name, relationshipType, and relatedToPersonId are required" });
+    }
+
+    if (!triggeringPhotoId) {
+      const isAdmin = await isFamilyAdministrator(personId, familyGroupId);
+      if (!isAdmin) {
+        return res
+          .status(403)
+          .json({ error: "Manually adding a family member can only be done by the family administrator" });
+      }
     }
 
     const token = crypto.randomBytes(24).toString("base64url");

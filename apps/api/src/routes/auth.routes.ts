@@ -22,6 +22,13 @@ authRouter.post("/register", async (req, res, next) => {
     const result = await db.transaction(async (trx) => {
       const [user] = await trx("users").insert({ email, password_hash: passwordHash }).returning("*");
 
+      // Whoever creates a brand-new family group becomes its administrator
+      // (docs/family_administrator_and_privacy_model.md section 1, "default").
+      // Joining an *existing* group via familyGroupId never sets this — that
+      // group already has exactly one administrator, enforced by the partial
+      // unique index in migration 023, and this insert would violate it if
+      // it ever tried.
+      const isNewFamilyGroup = !familyGroupId;
       const familyGroup = familyGroupId
         ? await trx("family_groups").where({ id: familyGroupId }).first()
         : (await trx("family_groups").insert({ name: familyGroupName ?? `${name}'s family` }).returning("*"))[0];
@@ -33,6 +40,7 @@ authRouter.post("/register", async (req, res, next) => {
           name,
           status: "active",
           privacy_tier: 2,
+          family_role: isNewFamilyGroup ? "administrator" : null,
         })
         .returning("*");
 

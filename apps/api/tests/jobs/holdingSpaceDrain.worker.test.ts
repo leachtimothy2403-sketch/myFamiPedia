@@ -16,10 +16,16 @@ function fakeVision(overrides: Partial<VisionService> = {}): VisionService {
   };
 }
 
+// Automated matching/enrollment is disabled (see the worker's header comment
+// and docs/family_administrator_and_privacy_model.md section 5) — this
+// worker no longer calls indexFace or searchFacesByImage, and deliberately
+// leaves holding_space rows un-archived rather than draining them via a
+// mechanism (retroactive matching) that no longer runs. That's a known,
+// documented gap pending the photo-pipeline rebuild, not a bug.
 describe("holding-space-drain worker", () => {
   const ctx = withDb();
 
-  it("enrolls from holding-space photos, retroactively matches existing family photos, and archives holding_space rows", async () => {
+  it("does not enroll or search, and leaves holding_space rows un-archived", async () => {
     const { processDrainJob } = await import("../../src/jobs/holdingSpaceDrain.worker");
     const knex = ctx.knex();
 
@@ -41,30 +47,25 @@ describe("holding-space-drain worker", () => {
       .returning("*");
 
     // A pre-existing family photo the subject appears in but was never tagged.
-    const [candidatePhoto] = await knex("photos")
-      .insert({ family_group_id: group.id, r2_key: "photos/old.jpg", uploaded_by: inviter.id })
-      .returning("*");
+    await knex("photos").insert({ family_group_id: group.id, r2_key: "photos/old.jpg", uploaded_by: inviter.id }).returning("*");
 
     const indexFace = vi.fn(async () => {});
-    const searchFacesByImage = vi.fn(async (_collectionId: string, _bytes: Buffer) => [
-      { externalImageId: subject.id, similarity: 97 },
-    ]);
+    const searchFacesByImage = vi.fn(async (): Promise<FaceMatch[]> => [{ externalImageId: subject.id, similarity: 97 }]);
     const vision = fakeVision({ indexFace, searchFacesByImage });
     const getBytes = vi.fn(async () => Buffer.from("fake-bytes"));
 
     const result = await processDrainJob({ personId: subject.id }, { vision, getBytes });
 
-    expect(indexFace).toHaveBeenCalledWith(`myfamipedia-${group.id}`, expect.any(Buffer), subject.id);
-    expect(result.newlyMatchedPhotoIds).toContain(candidatePhoto.id);
-
-    const photoPersons = await knex("photo_persons").where({ photo_id: candidatePhoto.id, person_id: subject.id });
-    expect(photoPersons).toHaveLength(1);
+    expect(indexFace).not.toHaveBeenCalled();
+    expect(searchFacesByImage).not.toHaveBeenCalled();
+    expect(result.newlyMatchedPhotoIds).toHaveLength(0);
+    expect(result.pendingHoldingSpaceRows).toBe(1);
 
     const refreshedHolding = await knex("holding_space").where({ id: holdingRow.id }).first();
-    expect(refreshedHolding.archived_at).not.toBeNull();
+    expect(refreshedHolding.archived_at).toBeNull();
   });
 
-  it("does not re-match a photo the subject is already linked to", async () => {
+  it("reports zero pending rows when there's nothing in holding_space for the person", async () => {
     const { processDrainJob } = await import("../../src/jobs/holdingSpaceDrain.worker");
     const knex = ctx.knex();
 
@@ -72,18 +73,12 @@ describe("holding-space-drain worker", () => {
     const [subject] = await knex("persons")
       .insert({ family_group_id: group.id, name: "Subject", status: "active" })
       .returning("*");
-    const [photo] = await knex("photos")
-      .insert({ family_group_id: group.id, r2_key: "photos/already-tagged.jpg", uploaded_by: subject.id })
-      .returning("*");
-    await knex("photo_persons").insert({ photo_id: photo.id, person_id: subject.id, identification_status: "confirmed" });
 
-    const searchFacesByImage = vi.fn(async () => [{ externalImageId: subject.id, similarity: 99 }]);
-    const vision = fakeVision({ searchFacesByImage });
+    const vision = fakeVision();
     const getBytes = vi.fn(async () => Buffer.from(""));
 
-    await processDrainJob({ personId: subject.id }, { vision, getBytes });
+    const result = await processDrainJob({ personId: subject.id }, { vision, getBytes });
 
-    // whereNotExists should have excluded this photo from the retroactive scan entirely
-    expect(searchFacesByImage).not.toHaveBeenCalled();
+    expect(result.pendingHoldingSpaceRows).toBe(0);
   });
 });

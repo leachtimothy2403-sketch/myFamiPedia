@@ -1,9 +1,8 @@
 import { Worker, Job } from "bullmq";
-import { connection, embeddingQueue } from "./queue";
+import { connection } from "./queue";
 import { withServiceContext } from "../db/pool";
 import { getObjectBuffer } from "../services/r2.service";
 import { visionService as defaultVisionService, collectionIdFor, VisionService } from "../services/vision.service";
-import { commitMatchedFace } from "./commitFaceMatch";
 
 export interface DetectJobData {
   photoId: string;
@@ -19,63 +18,36 @@ export interface FaceDetectionDeps {
 
 const defaultDeps: FaceDetectionDeps = { vision: defaultVisionService, getBytes: getObjectBuffer };
 
-// docs/media_pipeline.md section 2. One SearchFacesByImage call per photo
-// (rather than one per detected face box) is a deliberate simplification of
-// the doc's per-face wording — Rekognition's SearchFacesByImage already
-// matches every face it finds in the image against the collection in a
-// single call, so this is the same result with fewer external calls.
+// AUTOMATED MATCHING DISABLED (2026-07-18) — see
+// docs/family_administrator_and_privacy_model.md section 5. Running
+// SearchFacesByImage/IndexFaces against a biometric collection — including
+// against non-family bystanders who never consented — is a real GDPR
+// Article 9 exposure that hasn't been cleared by counsel. This worker now
+// only calls DetectFaces (bounding boxes, no identity — not biometric
+// identification data, no Article 9 exposure per the design doc). No
+// matching, no collection writes, no auto-created memories or proposals.
+// docs/media_pipeline.md section 2's SearchFacesByImage-based flow and
+// commitFaceMatch.ts's tier-1/tier-2 branching are retired for the beta;
+// they're left in place, unused, pending the manual tap-to-tag replacement
+// (design doc sections 5-7) rather than deleted outright.
 export async function processDetectJob(data: DetectJobData, deps: FaceDetectionDeps = defaultDeps) {
   const { photoId } = data;
   const photo = await withServiceContext((trx) => trx("photos").where({ id: photoId }).first());
   if (!photo) throw new Error(`Photo ${photoId} not found`);
 
   const imageBytes = await deps.getBytes(photo.r2_key);
-  const collectionId = collectionIdFor(photo.family_group_id);
-  await deps.vision.ensureCollection(collectionId);
+  const faces = await deps.vision.detectFaces(imageBytes);
 
-  const [faces, matches] = await Promise.all([
-    deps.vision.detectFaces(imageBytes),
-    deps.vision.searchFacesByImage(collectionId, imageBytes),
-  ]);
-
-  const matchedPersonIds: string[] = [];
-  const createdMemories: string[] = [];
-  const createdProposals: string[] = [];
-
-  await withServiceContext(async (trx) => {
-    for (const match of matches) {
-      const person = await trx("persons").where({ id: match.externalImageId }).first();
-      // Structurally shouldn't happen (only active persons are ever indexed —
-      // see the vision.service.ts module doc comment) but defensive in case a
-      // person was opted out after being indexed and before the collection
-      // purge caught up.
-      if (!person || person.status !== "active") continue;
-
-      const result = await commitMatchedFace(trx, photo, person);
-      matchedPersonIds.push(person.id);
-      if (result.memoryId) createdMemories.push(result.memoryId);
-      if (result.proposalId) createdProposals.push(result.proposalId);
-    }
-  });
-
-  // Every tier-1 auto-committed memory needs its embedding generated too —
-  // enqueued after the transaction commits, not inside commitMatchedFace,
-  // since BullMQ enqueueing isn't part of the DB transaction and shouldn't
-  // block on it.
-  await Promise.all(createdMemories.map((memoryId) => embeddingQueue.add("embed-memory", { memoryId })));
-
-  // Unmatched faces are deliberately not persisted anywhere (docs/media_pipeline.md
-  // section 2 step 4: "nothing is written to photo_persons or any biometric
-  // store") — they're only ever surfaced via this job's return value, for
-  // whatever calls this synchronously (a manual-tag UI flow, in future).
-  const unmatchedFaceCount = Math.max(0, faces.length - matches.length);
+  // Detected face regions are deliberately not persisted anywhere yet —
+  // they're only ever surfaced via this job's return value, for whatever
+  // calls this synchronously (the manual tap-to-tag UI flow, not yet built).
   return {
     photoId,
     facesDetected: faces.length,
-    matched: matchedPersonIds.length,
-    unmatchedFaceCount,
-    createdMemories,
-    createdProposals,
+    matched: 0,
+    unmatchedFaceCount: faces.length,
+    createdMemories: [] as string[],
+    createdProposals: [] as string[],
   };
 }
 

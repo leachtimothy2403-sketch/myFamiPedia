@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { requireAuth, AuthedRequest, markAsAdministratorAction } from "../middleware/auth";
+import { requireAuth, AuthedRequest, markAsAdministratorAction, requireFamilyAdministrator } from "../middleware/auth";
 import { withRlsContext } from "../db/pool";
 import { notImplemented } from "../utils/notImplemented";
 import { HttpError } from "../utils/httpError";
@@ -276,14 +276,19 @@ personsRouter.post("/relationships", requireAuth, async (req: AuthedRequest, res
 // invitation step at all — "no one to invite" (docs/data_model.md's "Adding
 // a family member — living vs. deceased branch") — so this is a straight
 // persons + relationships insert, no invitations row. The creator becomes
-// the profile's administrator; there's no separate nomination step for a
-// deceased person's admin the way there is for a living member's
-// (auth.routes.ts's nominate/confirm), since there's no one alive at that
-// profile to confirm anything.
+// the profile's *own* administrator (administrator_person_id, set below) —
+// separate from, and in addition to, the family-group-wide administrator
+// gate on who may *start* this profile in the first place
+// (docs/family_administrator_and_privacy_model.md section 1/2, "consequential
+// act" principle — initiating a deceased profile is one of the three gated
+// actions). requireFamilyAdministrator enforces that; there's no separate
+// nomination step for the deceased person's own admin the way there is for
+// a living member's (auth.routes.ts's nominate/confirm), since there's no
+// one alive at that profile to confirm anything.
 personsRouter.post(
   "/persons/deceased",
   requireAuth,
-  markAsAdministratorAction,
+  requireFamilyAdministrator,
   async (req: AuthedRequest, res, next) => {
     try {
       const { personId, familyGroupId } = req.auth!;
@@ -364,6 +369,62 @@ personsRouter.patch(
     }
   }
 );
+
+// Family-group administrator — docs/family_administrator_and_privacy_model.md
+// section 1. Separate from family_groups.paying_member_id (billing) and from
+// persons.administrator_person_id (per-deceased-profile, unrelated to this).
+// No :id param — scoped implicitly to the caller's own family_group_id via
+// req.auth, same convention as /persons/:id/privacy-tier being self-only.
+personsRouter.get("/family/administrator", requireAuth, async (req: AuthedRequest, res, next) => {
+  try {
+    const { personId, familyGroupId } = req.auth!;
+    const admin = await withRlsContext({ personId, familyGroupId }, (trx) =>
+      trx("persons").where({ family_group_id: familyGroupId, family_role: "administrator" }).first("id", "name")
+    );
+    res.json({ administrator: admin ? { personId: admin.id, name: admin.name } : null });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// "Ship with exactly one administrator per family group, transferable by the
+// current one" — design doc section 1. Callable only by the current
+// administrator; the target must be an active member of the same family
+// group (RLS tenant_isolation already confines the lookup to this family,
+// but "active" is checked explicitly — transferring onto a pending/deceased/
+// opted-out person would create an administrator who can't act). Clears the
+// old row before setting the new one, in that order, within one transaction
+// — the partial unique index (migration 023) would reject having both rows
+// carry family_role = 'administrator' at once, even transiently.
+personsRouter.post("/family/administrator/transfer", requireAuth, async (req: AuthedRequest, res, next) => {
+  try {
+    const { personId, familyGroupId } = req.auth!;
+    const { toPersonId } = req.body ?? {};
+    if (!toPersonId) return res.status(400).json({ error: "toPersonId is required" });
+
+    const result = await withRlsContext({ personId, familyGroupId }, async (trx) => {
+      const current = await trx("persons").where({ id: personId }).first();
+      if (!current || current.family_role !== "administrator") {
+        throw new HttpError(403, "Only the current family administrator can transfer this role");
+      }
+      const target = await trx("persons").where({ id: toPersonId, family_group_id: familyGroupId }).first();
+      if (!target) throw new HttpError(404, "Target person not found in this family group");
+      if (target.status !== "active") {
+        throw new HttpError(409, "The family administrator role can only be transferred to an active member");
+      }
+
+      await trx("persons").where({ id: personId }).update({ family_role: null, updated_at: new Date() });
+      const [updated] = await trx("persons")
+        .where({ id: toPersonId })
+        .update({ family_role: "administrator", updated_at: new Date() })
+        .returning("id", "name", "family_role");
+      return updated;
+    });
+    res.json({ administrator: { personId: result.id, name: result.name } });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // "Any family member contributes memory/photo/story" — no admin gate here,
 // unlike the state route above; the profile's administrator only curates

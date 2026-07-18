@@ -61,12 +61,23 @@ export interface TestUser {
 /** Registers a fresh account via the real /auth/register endpoint and returns its tokens/ids. */
 export async function registerTestUser(
   request: () => ReturnType<typeof supertest>,
-  overrides: Partial<{ email: string; password: string; name: string }> = {}
+  overrides: Partial<{ email: string; password: string; name: string; familyGroupId: string }> = {}
 ): Promise<TestUser> {
   const email = overrides.email ?? `test-${Math.random().toString(36).slice(2)}@example.com`;
   const res = await request()
     .post("/api/v1/auth/register")
-    .send({ email, password: overrides.password ?? "hunter2hunter2", name: overrides.name ?? "Test Person" });
+    .send({
+      email,
+      password: overrides.password ?? "hunter2hunter2",
+      name: overrides.name ?? "Test Person",
+      // Passing this joins an EXISTING family group instead of creating a new
+      // one — needed for tests that want a second, non-administrator member
+      // of the same family (every fresh registration with no familyGroupId
+      // becomes the administrator of its own brand-new family group, see
+      // auth.routes.ts and docs/family_administrator_and_privacy_model.md
+      // section 1).
+      familyGroupId: overrides.familyGroupId,
+    });
   if (res.status !== 201) {
     throw new Error(`registerTestUser failed: ${res.status} ${JSON.stringify(res.body)}`);
   }

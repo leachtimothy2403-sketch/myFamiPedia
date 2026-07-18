@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { requireAuth, AuthedRequest, markAsAdministratorAction } from "../middleware/auth";
+import { requireAuth, AuthedRequest, requireFamilyAdministrator } from "../middleware/auth";
 import { withRlsContext } from "../db/pool";
 import { notificationQueue, embeddingQueue } from "../jobs/queue";
 import { HttpError } from "../utils/httpError";
@@ -164,7 +164,7 @@ memoriesRouter.post("/memories/:id/retract", requireAuth, async (req: AuthedRequ
 memoriesRouter.post(
   "/memories/:id/restore-request",
   requireAuth,
-  markAsAdministratorAction,
+  requireFamilyAdministrator,
   async (req: AuthedRequest, res, next) => {
     try {
       const { personId, familyGroupId } = req.auth!;

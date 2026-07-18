@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { requireAuth, AuthedRequest, markAsAdministratorAction } from "../middleware/auth";
+import { requireAuth, AuthedRequest, requireSelfOrFamilyAdministrator } from "../middleware/auth";
 import { withRlsContext } from "../db/pool";
 import { voiceCloningQueue } from "../jobs/queue";
 import { HttpError } from "../utils/httpError";
@@ -101,7 +101,7 @@ voiceRouter.post("/persons/:id/voice-model/consent", requireAuth, async (req: Au
 voiceRouter.post(
   "/persons/:id/voice-model/pause",
   requireAuth,
-  markAsAdministratorAction,
+  requireSelfOrFamilyAdministrator(),
   async (req: AuthedRequest, res, next) => {
     try {
       const { personId, familyGroupId } = req.auth!;
@@ -130,7 +130,7 @@ voiceRouter.post(
 voiceRouter.post(
   "/persons/:id/voice-model/revoke",
   requireAuth,
-  markAsAdministratorAction,
+  requireSelfOrFamilyAdministrator(),
   async (req: AuthedRequest, res, next) => {
     try {
       const { personId, familyGroupId } = req.auth!;

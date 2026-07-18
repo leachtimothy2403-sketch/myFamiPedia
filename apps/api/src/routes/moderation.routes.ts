@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { requireAuth, AuthedRequest, markAsAdministratorAction } from "../middleware/auth";
+import { requireAuth, AuthedRequest, requireFamilyAdministrator } from "../middleware/auth";
 import { withRlsContext } from "../db/pool";
 import { HttpError } from "../utils/httpError";
 
@@ -27,7 +27,7 @@ moderationRouter.post("/flags", requireAuth, async (req: AuthedRequest, res, nex
 });
 
 // Administrator review queue.
-moderationRouter.get("/flags", requireAuth, markAsAdministratorAction, async (req: AuthedRequest, res, next) => {
+moderationRouter.get("/flags", requireAuth, requireFamilyAdministrator, async (req: AuthedRequest, res, next) => {
   try {
     const { personId, familyGroupId } = req.auth!;
     const { status } = req.query;
@@ -42,7 +42,7 @@ moderationRouter.get("/flags", requireAuth, markAsAdministratorAction, async (re
 });
 
 // Remove/dismiss. body: { status: 'removed' | 'dismissed', resolution? }
-moderationRouter.patch("/flags/:id", requireAuth, markAsAdministratorAction, async (req: AuthedRequest, res, next) => {
+moderationRouter.patch("/flags/:id", requireAuth, requireFamilyAdministrator, async (req: AuthedRequest, res, next) => {
   try {
     const { personId, familyGroupId } = req.auth!;
     const { status, resolution } = req.body ?? {};
