@@ -417,7 +417,7 @@ personsRouter.post("/family/administrator/transfer", requireAuth, async (req: Au
       const [updated] = await trx("persons")
         .where({ id: toPersonId })
         .update({ family_role: "administrator", updated_at: new Date() })
-        .returning("id", "name", "family_role");
+        .returning("*");
       return updated;
     });
     res.json({ administrator: { personId: result.id, name: result.name } });
