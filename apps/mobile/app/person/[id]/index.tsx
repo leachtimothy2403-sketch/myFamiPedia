@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { View, Text, TextInput, TouchableOpacity, Switch, ScrollView, ActivityIndicator } from "react-native";
-import { router, useLocalSearchParams } from "expo-router";
+import { router, useLocalSearchParams, Stack } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Memory, Person, Relationship, RelationshipType } from "@myfamipedia/shared";
 import { apiClient } from "../../../lib/apiClient";
@@ -82,15 +82,42 @@ function LifeTimeline({ events }: { events: TimelineEvent[] }) {
   );
 }
 
+type ReactionType = "touched_me" | "i_remember_this_too";
+
+// Was fire-and-forget with zero visual feedback either way, so a tap looked
+// identical whether it worked or silently failed. The Memory type doesn't
+// carry a reaction count/list back from the API, so this is honest
+// client-local optimistic confirmation that the tap registered — not a
+// true reflection of shared reaction state.
 function ReactionBar({ memoryId }: { memoryId: string }) {
+  const [sent, setSent] = useState<Partial<Record<ReactionType, boolean>>>({});
+  const [error, setError] = useState<string | null>(null);
+
+  async function react(reactionType: ReactionType) {
+    setError(null);
+    try {
+      await apiClient.reactToMemory(memoryId, { reactionType });
+      setSent((s) => ({ ...s, [reactionType]: true }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't save that reaction");
+    }
+  }
+
   return (
-    <View style={{ flexDirection: "row", gap: 16, marginTop: 8 }}>
-      <TouchableOpacity onPress={() => apiClient.reactToMemory(memoryId, { reactionType: "touched_me" })}>
-        <Text style={{ fontSize: 12, color: "#1a73e8" }}>This touched me</Text>
-      </TouchableOpacity>
-      <TouchableOpacity onPress={() => apiClient.reactToMemory(memoryId, { reactionType: "i_remember_this_too" })}>
-        <Text style={{ fontSize: 12, color: "#1a73e8" }}>I remember this too</Text>
-      </TouchableOpacity>
+    <View style={{ marginTop: 8 }}>
+      <View style={{ flexDirection: "row", gap: 16 }}>
+        <TouchableOpacity onPress={() => react("touched_me")} disabled={sent.touched_me}>
+          <Text style={{ fontSize: 12, color: sent.touched_me ? "#0f766e" : "#1a73e8" }}>
+            {sent.touched_me ? "✓ This touched me" : "This touched me"}
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={() => react("i_remember_this_too")} disabled={sent.i_remember_this_too}>
+          <Text style={{ fontSize: 12, color: sent.i_remember_this_too ? "#0f766e" : "#1a73e8" }}>
+            {sent.i_remember_this_too ? "✓ I remember this too" : "I remember this too"}
+          </Text>
+        </TouchableOpacity>
+      </View>
+      {error ? <Text style={{ color: "#b3261e", fontSize: 12, marginTop: 4 }}>{error}</Text> : null}
     </View>
   );
 }
@@ -250,7 +277,18 @@ function ConnectionsPanel({
 }) {
   const personById = useMemo(() => new Map(persons.map((p) => [p.id, p])), [persons]);
 
+  // getFamilyTree returns every relationship in the whole family group, not
+  // just the ones touching this profile (it's a single shared query backing
+  // the tree canvas too) — this was missing a filter down to relationships
+  // that actually involve `profileId`, so relationships between OTHER two
+  // people in the tree (e.g. Tim <-> someone who isn't this profile) were
+  // still being mapped and mislabeled from this profile's point of view,
+  // since the reverse-direction branch below just assumes personAId is
+  // "the other person" without checking either id actually matches
+  // profileId first. That's what produced phantom connections unrelated to
+  // the profile being viewed.
   const connections = relationships
+    .filter((r) => r.personAId === profileId || r.personBId === profileId)
     .map((r) => {
       const isForward = r.personAId === profileId;
       const otherId = isForward ? r.personBId : r.personAId;
@@ -306,9 +344,12 @@ export default function PersonProfileScreen() {
     enabled: Boolean(familyGroupId),
   });
 
+  // excludeVoice=true: this feed is for memories someone specifically chose
+  // to enter, not raw Q&A/story recordings — see the route's comment in
+  // apps/api/src/routes/persons.routes.ts.
   const { data: memories } = useQuery({
     queryKey: ["person-memories", id],
-    queryFn: () => apiClient.request<{ items: Memory[] }>(`/persons/${id}/memories`),
+    queryFn: () => apiClient.request<{ items: Memory[] }>(`/persons/${id}/memories?excludeVoice=true`),
     enabled: Boolean(id),
   });
 
@@ -345,6 +386,7 @@ export default function PersonProfileScreen() {
 
   return (
     <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16 }}>
+      <Stack.Screen options={{ title: person.name }} />
       <ProfileHeader person={person} />
       <LifeTimeline events={timelineEvents} />
       <AddMemoryForm personId={id} />

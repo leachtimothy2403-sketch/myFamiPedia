@@ -29,9 +29,12 @@ export default function PersonProfileRoute() {
     enabled: Boolean(familyGroupId),
   });
 
+  // excludeVoice=true: this feed is for memories someone specifically chose
+  // to enter, not raw Q&A/story recordings — see the route's comment in
+  // apps/api/src/routes/persons.routes.ts.
   const { data: memories } = useQuery({
     queryKey: ["person-memories", id],
-    queryFn: () => apiClient.request<{ items: Memory[] }>(`/persons/${id}/memories`),
+    queryFn: () => apiClient.request<{ items: Memory[] }>(`/persons/${id}/memories?excludeVoice=true`),
   });
 
   const { data: timeline } = useQuery({

@@ -152,6 +152,89 @@ describe("persons", () => {
       expect(res.body.page).toBe(1);
       expect(res.body.pageSize).toBe(2);
     });
+
+    it("includes voice (Q&A-recorded) memories by default, for the manage-memories screen", async () => {
+      await ctx.knex()("memories").insert({
+        family_group_id: user.familyGroupId,
+        contributor_id: user.personId,
+        content: "Recorded answer",
+        provenance_type: "voice",
+      });
+      const res = await ctx
+        .request()
+        .get(`/api/v1/persons/${user.personId}/memories`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(200);
+      expect(res.body.items).toHaveLength(1);
+      expect(res.body.items[0].provenance_type).toBe("voice");
+    });
+
+    it("excludeVoice=true drops Q&A-recorded memories, for the profile Memories Feed", async () => {
+      await ctx.knex()("memories").insert([
+        { family_group_id: user.familyGroupId, contributor_id: user.personId, content: "Recorded answer", provenance_type: "voice" },
+        { family_group_id: user.familyGroupId, contributor_id: user.personId, content: "Typed in by hand", provenance_type: "text" },
+      ]);
+      const res = await ctx
+        .request()
+        .get(`/api/v1/persons/${user.personId}/memories?excludeVoice=true`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(200);
+      expect(res.body.items).toHaveLength(1);
+      expect(res.body.items[0].content).toBe("Typed in by hand");
+    });
+  });
+
+  describe("GET /family-groups/:id/memories (Home tab family feed)", () => {
+    it("returns memories contributed by anyone in the family group", async () => {
+      const [other] = await ctx
+        .knex()("persons")
+        .insert({ family_group_id: user.familyGroupId, name: "Other", status: "active" })
+        .returning("*");
+      await ctx.knex()("memories").insert({
+        family_group_id: user.familyGroupId,
+        contributor_id: other.id,
+        content: "Other's memory",
+        provenance_type: "text",
+      });
+      const res = await ctx
+        .request()
+        .get(`/api/v1/family-groups/${user.familyGroupId}/memories`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(200);
+      expect(res.body.items).toHaveLength(1);
+      expect(res.body.items[0].content).toBe("Other's memory");
+      expect(res.body.items[0].contributor_name).toBe("Other");
+    });
+
+    it("does not return memories from a different family group", async () => {
+      const otherFamily = await registerTestUser(ctx.request);
+      await ctx.knex()("memories").insert({
+        family_group_id: otherFamily.familyGroupId,
+        contributor_id: otherFamily.personId,
+        content: "Not this family",
+        provenance_type: "text",
+      });
+      const res = await ctx
+        .request()
+        .get(`/api/v1/family-groups/${user.familyGroupId}/memories`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(200);
+      expect(res.body.items).toHaveLength(0);
+    });
+
+    it("excludeVoice=true drops Q&A-recorded memories from the family feed", async () => {
+      await ctx.knex()("memories").insert([
+        { family_group_id: user.familyGroupId, contributor_id: user.personId, content: "Recorded answer", provenance_type: "voice" },
+        { family_group_id: user.familyGroupId, contributor_id: user.personId, content: "Typed in by hand", provenance_type: "text" },
+      ]);
+      const res = await ctx
+        .request()
+        .get(`/api/v1/family-groups/${user.familyGroupId}/memories?excludeVoice=true`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(200);
+      expect(res.body.items).toHaveLength(1);
+      expect(res.body.items[0].content).toBe("Typed in by hand");
+    });
   });
 
   describe("relationships", () => {

@@ -29,6 +29,44 @@ personsRouter.get("/family-groups/:id/tree", requireAuth, async (req: AuthedRequ
   }
 });
 
+// Family-wide "recent memories" feed for the Home tab (mobile_app_structure.md's
+// "Home: memory feed (section 9)"). Was never actually built — the Home screen
+// was calling GET /notifications instead and discarding every row (renderItem
+// returned null), so nothing rendered regardless of what was in the family.
+//
+// Deliberately filters on `familyGroupId` from the auth context, not
+// `req.params.id`: unlike `persons`, the `memories` table has RLS *enabled*
+// (migration 010) but its only SELECT policy (`memory_privacy`) checks
+// retracted/is_private, not family_group_id — there's no tenant_isolation
+// equivalent for memories the way there is for persons. So an app-level
+// family_group_id filter here is load-bearing, not defense-in-depth; without
+// it this would leak every other family's non-private memories.
+// excludeVoice=true (used by the mobile Home screen) matches
+// /persons/:id/memories' convention: raw Q&A/story recordings aren't
+// "specifically entered" memories, so they're left out of both feeds.
+personsRouter.get("/family-groups/:id/memories", requireAuth, async (req: AuthedRequest, res, next) => {
+  try {
+    const { personId, familyGroupId } = req.auth!;
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const pageSize = Math.min(100, Number(req.query.pageSize) || 20);
+    const excludeVoice = req.query.excludeVoice === "true";
+
+    const items = await withRlsContext({ personId, familyGroupId }, (trx) => {
+      let q = trx("memories")
+        .select("memories.*", "persons.name as contributor_name")
+        .join("persons", "persons.id", "memories.contributor_id")
+        .where("memories.family_group_id", familyGroupId);
+      if (excludeVoice) {
+        q = q.whereNot("memories.provenance_type", "voice");
+      }
+      return q.orderBy("memories.created_at", "desc").limit(pageSize).offset((page - 1) * pageSize);
+    });
+    res.json({ items, page, pageSize });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Profile: header stats, tags, timeline, connections. Reads through
 // persons_tree_view (not the raw table) so the opted_out profile_data/
 // ai_summary masking lives in one place — see docs/privacy_enforcement.md.
@@ -113,21 +151,37 @@ personsRouter.get("/persons/:id/timeline", requireAuth, async (req: AuthedReques
 
 // Paginated memories feed for this profile — contributed by this person, or
 // featuring them. `?page=`/`?pageSize=` both optional, default 20/page.
+//
+// `?excludeVoice=true` drops provenance_type = 'voice' rows. Both "Share a
+// memory / talk about your life" and "Q & A" on mobile's Share your story
+// screen record through the same interview-session -> transcribeAnswer.ts
+// pipeline, which lands every recorded answer here as a 'voice'-provenance
+// memory (see migration 008's interview_answers.memory_id and
+// transcribeAnswer.ts). Per product direction, the person-profile Memories
+// Feed (apps/mobile person/[id]/index.tsx, apps/web person/[id]/index.tsx)
+// should only show memories someone specifically chose to enter (text via
+// AddMemoryForm, or an accepted photo proposal) — not raw Q&A/story
+// recordings — so those callers pass excludeVoice=true. This route is also
+// reused by collection/manage.tsx's "Your memories" screen, which still
+// needs voice memories listed (it's the only place you can retract one), so
+// the default stays false rather than filtering unconditionally.
 personsRouter.get("/persons/:id/memories", requireAuth, async (req: AuthedRequest, res, next) => {
   try {
     const { personId, familyGroupId } = req.auth!;
     const page = Math.max(1, Number(req.query.page) || 1);
     const pageSize = Math.min(100, Number(req.query.pageSize) || 20);
+    const excludeVoice = req.query.excludeVoice === "true";
 
-    const items = await withRlsContext({ personId, familyGroupId }, (trx) =>
-      trx("memories")
+    const items = await withRlsContext({ personId, familyGroupId }, (trx) => {
+      let q = trx("memories")
         .distinct("memories.*")
         .leftJoin("memory_persons", "memory_persons.memory_id", "memories.id")
-        .where((qb) => qb.where("memories.contributor_id", req.params.id).orWhere("memory_persons.person_id", req.params.id))
-        .orderBy("memories.created_at", "desc")
-        .limit(pageSize)
-        .offset((page - 1) * pageSize)
-    );
+        .where((qb) => qb.where("memories.contributor_id", req.params.id).orWhere("memory_persons.person_id", req.params.id));
+      if (excludeVoice) {
+        q = q.whereNot("memories.provenance_type", "voice");
+      }
+      return q.orderBy("memories.created_at", "desc").limit(pageSize).offset((page - 1) * pageSize);
+    });
     res.json({ items, page, pageSize });
   } catch (err) {
     next(err);
