@@ -4,6 +4,7 @@ import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { withRlsContext } from "../db/pool";
 import { presignUpload } from "../services/r2.service";
 import { HttpError } from "../utils/httpError";
+import { faceDetectionQueue, embeddingQueue, sceneClassificationQueue, photoClusteringQueue } from "../jobs/queue";
 
 export const uploadsRouter = Router();
 
@@ -86,6 +87,20 @@ uploadsRouter.post("/uploads/:id/complete", requireAuth, async (req: AuthedReque
       }
       return { r2Key: upload.r2_key };
     });
+
+    // Previously only POST /collection/camera-roll/sync enqueued any of
+    // this — a manually-uploaded single photo got a `photos` row and
+    // nothing else: no face detection, no tap-to-tag targets, no scene
+    // classification, no clustering. Same job set as the sync route, just
+    // for a batch of one, so photoClusteringQueue still gets exactly one
+    // enqueue per completed upload rather than one per detected face.
+    if ("photoId" in result) {
+      const photoId = result.photoId;
+      await faceDetectionQueue.add("detect", { photoId });
+      await embeddingQueue.add("embed-photo", { photoId });
+      await sceneClassificationQueue.add("classify", { photoId });
+      await photoClusteringQueue.add("cluster", { familyGroupId });
+    }
 
     res.status(201).json(result);
   } catch (err) {

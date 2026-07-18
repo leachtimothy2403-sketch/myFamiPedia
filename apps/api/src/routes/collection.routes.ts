@@ -154,8 +154,11 @@ collectionRouter.patch("/persons/:id/privacy-tier", requireAuth, async (req: Aut
       throw new HttpError(403, "Privacy tier cannot be changed by anyone other than the person themself");
     }
     const { privacyTier } = req.body ?? {};
-    if (![1, 2, 3].includes(privacyTier)) {
-      return res.status(400).json({ error: "privacyTier must be 1, 2, or 3" });
+    // Tier 1 is retired (migration 025) — it depended on automated face
+    // matching that no longer exists, and had no live behavior left. See
+    // docs/section2_pipeline.md section 1.
+    if (![2, 3].includes(privacyTier)) {
+      return res.status(400).json({ error: "privacyTier must be 2 or 3" });
     }
     const [person] = await withRlsContext({ personId, familyGroupId }, (trx) =>
       trx("persons").where({ id: req.params.id }).update({ privacy_tier: privacyTier }).returning("privacy_tier")

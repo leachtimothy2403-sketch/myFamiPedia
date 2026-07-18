@@ -22,8 +22,12 @@ describe("face-detection worker", () => {
     const [contributor] = await knex("persons")
       .insert({ family_group_id: group.id, name: "Uploader", status: "active" })
       .returning("*");
-    const [tier1Person] = await knex("persons")
-      .insert({ family_group_id: group.id, name: "Tier1 Person", status: "active", privacy_tier: 1 })
+    // privacy_tier is otherwise irrelevant to this file's tests — detection
+    // never branches on it (that's the whole point of these tests) — these
+    // just need a valid, non-retired value (tier 1 was removed by
+    // migration 025).
+    const [personA] = await knex("persons")
+      .insert({ family_group_id: group.id, name: "Person A", status: "active", privacy_tier: 2 })
       .returning("*");
     const [tier2Person] = await knex("persons")
       .insert({ family_group_id: group.id, name: "Tier2 Person", status: "active", privacy_tier: 2 })
@@ -31,7 +35,7 @@ describe("face-detection worker", () => {
     const [photo] = await knex("photos")
       .insert({ family_group_id: group.id, r2_key: "photos/1.jpg", uploaded_by: contributor.id })
       .returning("*");
-    return { group, contributor, tier1Person, tier2Person, photo };
+    return { group, contributor, personA, tier2Person, photo };
   }
 
   // Automated matching is disabled (see the worker's header comment and
@@ -120,14 +124,14 @@ describe("face-detection worker", () => {
 
   it("remove-from-collection calls deleteFaces against the person's family collection", async () => {
     const { processRemoveFromCollectionJob } = await import("../../src/jobs/faceDetection.worker");
-    const { tier1Person } = await seedFamily();
+    const { personA } = await seedFamily();
 
     const deleteFaces = vi.fn(async () => {});
     const vision = fakeVision({ deleteFaces });
     const getBytes = vi.fn(async () => Buffer.from(""));
 
-    await processRemoveFromCollectionJob({ personId: tier1Person.id }, { vision, getBytes });
+    await processRemoveFromCollectionJob({ personId: personA.id }, { vision, getBytes });
 
-    expect(deleteFaces).toHaveBeenCalledWith(`myfamipedia-${tier1Person.family_group_id}`, tier1Person.id);
+    expect(deleteFaces).toHaveBeenCalledWith(`myfamipedia-${personA.family_group_id}`, personA.id);
   });
 });

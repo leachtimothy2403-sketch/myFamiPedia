@@ -162,9 +162,9 @@ describe("collection", () => {
         .request()
         .patch(`/api/v1/persons/${user.personId}/privacy-tier`)
         .set("Authorization", `Bearer ${user.accessToken}`)
-        .send({ privacyTier: 1 });
+        .send({ privacyTier: 3 });
       expect(patchRes.status).toBe(200);
-      expect(patchRes.body.privacyTier).toBe(1);
+      expect(patchRes.body.privacyTier).toBe(3);
     });
 
     it("rejects changing someone else's privacy tier", async () => {
@@ -183,6 +183,18 @@ describe("collection", () => {
         .patch(`/api/v1/persons/${user.personId}/privacy-tier`)
         .set("Authorization", `Bearer ${user.accessToken}`)
         .send({ privacyTier: 7 });
+      expect(res.status).toBe(400);
+    });
+
+    // Tier 1 is retired (migration 025) — it had no live behavior left once
+    // automated face matching was disabled. See docs/section2_pipeline.md
+    // section 1.
+    it("rejects the retired tier 1", async () => {
+      const res = await ctx
+        .request()
+        .patch(`/api/v1/persons/${user.personId}/privacy-tier`)
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ privacyTier: 1 });
       expect(res.status).toBe(400);
     });
   });
