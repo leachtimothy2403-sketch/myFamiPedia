@@ -4,6 +4,21 @@ import { db } from "../db/pool";
 
 export const notificationsRouter = Router();
 
+// Canonical list of notification types the pipeline actually dispatches
+// (see jobs/scheduledJobs.worker.ts and routes/memories.routes.ts for the
+// `type`/`notification_type` values used at send time). notification_settings
+// only ever stores override rows — a user who has never toggled anything has
+// zero rows — so GET /notifications/settings must merge this list against
+// whatever overrides exist, defaulting to enabled: true, rather than just
+// returning the (usually empty) rows table directly.
+const NOTIFICATION_TYPES = [
+  "review_cards_ready",
+  "manual_tier_nudge",
+  "question_prompt_ready",
+  "memory_retracted",
+  "memory_restore_requested",
+];
+
 // Notifications are user-scoped (notifications.user_id), not person-scoped —
 // unlike almost everything else in this API, since a login can only ever
 // belong to one person anyway, but the notification pipeline (docs/
@@ -23,7 +38,12 @@ notificationsRouter.get("/notifications", requireAuth, async (req: AuthedRequest
 notificationsRouter.get("/notifications/settings", requireAuth, async (req: AuthedRequest, res, next) => {
   try {
     const rows = await db("notification_settings").where({ user_id: req.auth!.userId });
-    res.json({ items: rows });
+    const overrides = new Map(rows.map((r) => [r.notification_type, r.enabled]));
+    const items = NOTIFICATION_TYPES.map((notificationType) => ({
+      notificationType,
+      enabled: overrides.has(notificationType) ? overrides.get(notificationType) : true,
+    }));
+    res.json({ items });
   } catch (err) {
     next(err);
   }

@@ -29,7 +29,16 @@ const REVERSE_LABEL: Record<RelationshipType, string> = {
 export function ConnectionsPanel({ profileId, relationships, persons }: ConnectionsPanelProps) {
   const personById = new Map(persons.map((p) => [p.id, p]));
 
+  // getFamilyTree returns every relationship in the whole family group, not
+  // just the ones touching this profile — this was missing a filter down to
+  // relationships that actually involve `profileId`, so relationships
+  // between two OTHER people in the tree were still being mapped and
+  // mislabeled from this profile's point of view (the reverse-direction
+  // branch below assumes personAId is "the other person" without first
+  // checking either id matches profileId), producing phantom connections
+  // unrelated to the profile being viewed.
   const connections = relationships
+    .filter((r) => r.personAId === profileId || r.personBId === profileId)
     .map((r) => {
       const isForward = r.personAId === profileId;
       const otherId = isForward ? r.personBId : r.personAId;

@@ -1,4 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { notificationTypeLabel } from "@myfamipedia/shared";
 import { apiClient } from "../../lib/apiClient";
 
 interface NotificationSetting {
@@ -36,7 +37,7 @@ export default function NotificationSettingsRoute() {
               checked={s.enabled}
               onChange={(e) => update.mutate({ notificationType: s.notificationType, enabled: e.target.checked })}
             />{" "}
-            {s.notificationType}
+            {notificationTypeLabel(s.notificationType)}
           </label>
         ))
       )}

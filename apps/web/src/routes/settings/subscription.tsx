@@ -1,17 +1,30 @@
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiClient } from "../../lib/apiClient";
+import { getFamilyGroupId } from "../../lib/session";
 
-// Family plan management, takeover flow — any member becomes paying member +
-// administrator, one tap (see docs/api_structure.md, Subscription & family group).
+// Was hardcoded to /family-groups/me/subscription — "me" isn't a real
+// family group id, so this always 403'd (apps/api's subscription.routes.ts
+// checks req.params.id === req.auth.familyGroupId). Fixed the same way the
+// tree tab was fixed last session. Also added the missing cache
+// invalidation after takeover — previously the status shown wouldn't
+// refresh after a successful takeover without a manual page reload.
 export default function SubscriptionSettingsRoute() {
+  const familyGroupId = getFamilyGroupId() ?? "";
+  const qc = useQueryClient();
+
   const { data } = useQuery({
-    queryKey: ["subscription"],
-    queryFn: () => apiClient.request<{ status: string; gracePeriodEnd: string | null }>(
-      "/family-groups/me/subscription"
-    ),
+    queryKey: ["subscription", familyGroupId],
+    queryFn: () =>
+      apiClient.request<{ status: string; gracePeriodEnd: string | null }>(
+        `/family-groups/${familyGroupId}/subscription`
+      ),
+    enabled: Boolean(familyGroupId),
   });
+
   const takeover = useMutation({
-    mutationFn: () => apiClient.request("/family-groups/me/subscription/takeover", { method: "POST" }),
+    mutationFn: () =>
+      apiClient.request(`/family-groups/${familyGroupId}/subscription/takeover`, { method: "POST" }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["subscription", familyGroupId] }),
   });
 
   return (
@@ -19,7 +32,9 @@ export default function SubscriptionSettingsRoute() {
       <h1>Subscription</h1>
       <p>Status: {data?.status ?? "—"}</p>
       {data?.gracePeriodEnd ? <p>Grace period ends: {data.gracePeriodEnd}</p> : null}
-      <button onClick={() => takeover.mutate()}>Become the paying member</button>
+      <button onClick={() => takeover.mutate()} disabled={takeover.isPending}>
+        {takeover.isPending ? "Working…" : "Become the paying member"}
+      </button>
     </div>
   );
 }

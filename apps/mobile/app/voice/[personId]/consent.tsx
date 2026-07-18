@@ -29,6 +29,12 @@ export default function VoiceConsentScreen() {
     <View style={{ flex: 1, justifyContent: "center", padding: 24, gap: 12 }}>
       {moment === "preview" && (
         <>
+          {/* Was jumping straight to "hear a preview" with no explanation of
+              what the feature actually does — added per product feedback. */}
+          <Text style={{ fontSize: 15, color: "#444" }}>
+            myFamiPedia can generate an AI version of your voice that can read your memories aloud to family, even
+            after you're gone. It's built from a short recording and only ever used with your consent.
+          </Text>
           <Text style={{ fontSize: 20, fontWeight: "600" }}>Hear a 10-second preview of your voice</Text>
           <Button title="Play preview" onPress={preview} />
         </>

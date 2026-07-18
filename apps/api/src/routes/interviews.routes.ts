@@ -82,7 +82,7 @@ interviewsRouter.get("/interview-questions/next", requireAuth, async (req: Authe
         .whereNotNull("ia.transcript")
         .orderBy("ia.created_at", "desc")
         .limit(8)
-        .select("ia.id", "q.text as question_text", "ia.transcript as answer_text");
+        .select("ia.id", "q.text as question_text", "ia.transcript as answer_text", "q.life_phase as question_life_phase");
 
       if (priorAnswers.length === 0) {
         // No transcribed answers to build on yet (either genuinely new, or
@@ -94,9 +94,10 @@ interviewsRouter.get("/interview-questions/next", requireAuth, async (req: Authe
 
       const questionText = await generateFollowUpQuestion({
         personName: person.name,
-        priorQAs: priorAnswers.map((a: { question_text: string; answer_text: string }) => ({
+        priorQAs: priorAnswers.map((a: { question_text: string; answer_text: string; question_life_phase: string }) => ({
           question: a.question_text,
           answer: a.answer_text,
+          lifePhase: a.question_life_phase,
         })),
       });
 

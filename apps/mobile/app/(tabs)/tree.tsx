@@ -5,7 +5,8 @@ import { useQuery } from "@tanstack/react-query";
 import type { Person } from "@myfamipedia/shared";
 import { apiClient } from "../../lib/apiClient";
 import { useSessionIds } from "../../lib/useSessionIds";
-import { groupByGeneration, groupByDecade } from "../../lib/treeGrouping";
+import { groupByDecade } from "../../lib/treeGrouping";
+import { TreeCanvas } from "../../components/tree/TreeCanvas";
 
 type TreeMode = "structure" | "by-person" | "by-decade";
 
@@ -60,10 +61,6 @@ export default function TreeScreen() {
   const persons = data?.persons ?? [];
   const relationships = data?.relationships ?? [];
 
-  const generationGroups = useMemo(
-    () => groupByGeneration(persons, relationships, personId),
-    [persons, relationships, personId]
-  );
   const decadeGroups = useMemo(() => groupByDecade(persons), [persons]);
   const filteredPersons = useMemo(
     () =>
@@ -104,21 +101,33 @@ export default function TreeScreen() {
         ))}
       </View>
 
+      {/* Was entirely missing on mobile — web's tree page has an "+ Add
+          family member" button, mobile never did. Links to the new
+          app/family-member/new.tsx screen (this session). */}
+      <TouchableOpacity
+        onPress={() => router.push("/family-member/new")}
+        style={{
+          marginHorizontal: 16,
+          marginBottom: 12,
+          paddingVertical: 10,
+          borderRadius: 8,
+          alignItems: "center",
+          backgroundColor: "#1a73e8",
+        }}
+      >
+        <Text style={{ color: "white", fontWeight: "600" }}>+ Add family member</Text>
+      </TouchableOpacity>
+
       {persons.length === 0 ? (
         <View style={{ flex: 1, alignItems: "center", justifyContent: "center", padding: 24 }}>
           <Text style={{ color: "#888" }}>No one in the tree yet.</Text>
         </View>
       ) : mode === "structure" ? (
-        <SectionList
-          sections={generationGroups.map((g) => ({ title: g.label, data: g.persons }))}
-          keyExtractor={(item) => item.id}
-          renderItem={({ item }) => <PersonRow person={item} isSelf={item.id === personId} />}
-          renderSectionHeader={({ section }) => (
-            <Text style={{ fontWeight: "600", paddingVertical: 8, paddingHorizontal: 4, backgroundColor: "#fafafa" }}>
-              {section.title}
-            </Text>
-          )}
-          contentContainerStyle={{ paddingHorizontal: 16 }}
+        <TreeCanvas
+          persons={persons}
+          relationships={relationships}
+          rootPersonId={personId}
+          onSelectPerson={(id) => router.push(`/person/${id}`)}
         />
       ) : mode === "by-person" ? (
         <View style={{ flex: 1, paddingHorizontal: 16 }}>

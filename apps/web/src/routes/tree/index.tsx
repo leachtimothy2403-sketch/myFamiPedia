@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, Link } from "react-router-dom";
 import { useFamilyTree } from "../../hooks/useFamilyTree";
 import { TreeCanvas } from "../../components/tree/TreeCanvas";
 import { AddFamilyMemberPanel } from "../../components/tree/AddFamilyMemberPanel";
@@ -36,7 +36,8 @@ export default function TreeRoute() {
         }}
       >
         <strong>myFamiPedia</strong>
-        <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <Link to="/search">Search</Link>
           <button onClick={() => setShowAddPanel((v) => !v)} disabled={isLoading || isError}>
             + Add family member
           </button>

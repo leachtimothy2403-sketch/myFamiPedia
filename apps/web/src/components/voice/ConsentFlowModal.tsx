@@ -31,6 +31,12 @@ export function ConsentFlowModal({ personId, onClose }: ConsentFlowModalProps) {
       <div style={{ background: "white", margin: "10% auto", padding: 24, maxWidth: 400 }}>
         {moment === "preview" && (
           <>
+            {/* Was jumping straight to "hear a preview" with no explanation
+                of what the feature actually does — added per product feedback. */}
+            <p style={{ fontSize: 14, color: "#444" }}>
+              myFamiPedia can generate an AI version of your voice that can read your memories aloud to family, even
+              after you're gone. It's built from a short recording and only ever used with your consent.
+            </p>
             <h2>Hear a 10-second preview of your voice</h2>
             <button onClick={preview}>Play preview</button>
           </>

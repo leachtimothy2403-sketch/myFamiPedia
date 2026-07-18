@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { View, Text, TextInput, TouchableOpacity } from "react-native";
-import { useLocalSearchParams } from "expo-router";
+import { useLocalSearchParams, Stack } from "expo-router";
+import { useQuery } from "@tanstack/react-query";
 import { apiClient } from "../../../lib/apiClient";
 
 // Ask feature: real clip match(es) first, AI synthesis fallback, gap
@@ -10,6 +11,11 @@ import { apiClient } from "../../../lib/apiClient";
 // unhandled rejection — mobile's counterpart to apps/web's AskPanel.
 export default function AskScreen() {
   const { id = "" } = useLocalSearchParams<{ id: string }>();
+  const { data: person } = useQuery({
+    queryKey: ["person", id],
+    queryFn: () => apiClient.getPerson(id),
+    enabled: Boolean(id),
+  });
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -33,6 +39,7 @@ export default function AskScreen() {
 
   return (
     <View style={{ flex: 1, padding: 16, gap: 12 }}>
+      <Stack.Screen options={{ title: person ? `Ask about ${person.name}` : "Ask" }} />
       <TextInput
         placeholder="Ask something…"
         value={question}

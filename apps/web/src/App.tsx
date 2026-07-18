@@ -10,6 +10,7 @@ import PersonAskRoute from "./routes/person/[id]/ask";
 import PersonEditRoute from "./routes/person/[id]/edit";
 import ExplorePersonRoute from "./routes/explore/person";
 import ExploreDecadeRoute from "./routes/explore/decade/[decade]";
+import SearchRoute from "./routes/search/index";
 import ModerationQueueRoute from "./routes/admin/moderation-queue";
 import NewDeceasedProfileRoute from "./routes/admin/deceased-profile/new";
 import PrivacySettingsRoute from "./routes/settings/privacy";
@@ -39,6 +40,7 @@ export default function App() {
 
       <Route path="/explore/person" element={<RequireAuth><ExplorePersonRoute /></RequireAuth>} />
       <Route path="/explore/decade/:decade" element={<RequireAuth><ExploreDecadeRoute /></RequireAuth>} />
+      <Route path="/search" element={<RequireAuth><SearchRoute /></RequireAuth>} />
 
       <Route path="/admin/moderation-queue" element={<RequireAuth><ModerationQueueRoute /></RequireAuth>} />
       <Route path="/admin/deceased-profile/new" element={<RequireAuth><NewDeceasedProfileRoute /></RequireAuth>} />

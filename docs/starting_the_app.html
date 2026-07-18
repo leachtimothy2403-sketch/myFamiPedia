@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>myFamiPedia — Starting the app</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; line-height: 1.5; }
+  h1 { font-size: 24px; margin-bottom: 4px; }
+  h2 { font-size: 17px; margin-top: 32px; border-bottom: 1px solid #eee; padding-bottom: 6px; }
+  .terminal { background: #f6f6f6; border: 1px solid #ddd; border-radius: 8px; padding: 14px 16px; margin: 10px 0; }
+  .terminal .label { font-size: 12px; font-weight: 600; color: #1a73e8; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+  code, pre { font-family: Consolas, Menlo, monospace; font-size: 13.5px; }
+  pre { background: #1e1e1e; color: #e6e6e6; padding: 12px 14px; border-radius: 6px; overflow-x: auto; margin: 6px 0; }
+  .note { font-size: 13.5px; color: #555; margin-top: 6px; }
+  .keep-open { display: inline-block; background: #fff3cd; color: #7a5c00; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px; margin-left: 8px; }
+  .once { display: inline-block; background: #e6f0ff; color: #1a4d99; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px; margin-left: 8px; }
+</style>
+</head>
+<body>
+
+<h1>Starting myFamiPedia locally</h1>
+<p class="note">Five terminal windows, run in order. All from <code>C:\Users\leach\myfamipedia</code> unless noted.</p>
+
+<h2>0. Docker</h2>
+<div class="terminal">
+  <div class="label">Check first — no terminal needed if already running</div>
+  <p class="note">Confirm Postgres and Redis containers are up (matching <code>DATABASE_URL</code> / <code>REDIS_URL</code> in <code>.env</code>).</p>
+</div>
+
+<h2>1. Database migrations + seed data <span class="once">run once / after schema changes</span></h2>
+<div class="terminal">
+  <div class="label">Terminal 1</div>
+  <pre>cd C:\Users\leach\myfamipedia
+npx pnpm@9.15.9 migrate
+npx pnpm@9.15.9 seed</pre>
+  <p class="note">Migrate is only needed the first time, or after a migration file is added. Seed loads reference data (e.g. the curated interview question bank) — separate from migrations, easy to forget, safe to re-run. Can close this terminal once both finish.</p>
+</div>
+
+<h2>2. API server <span class="keep-open">keep open</span></h2>
+<div class="terminal">
+  <div class="label">Terminal 2</div>
+  <pre>cd C:\Users\leach\myfamipedia
+npx pnpm@9.15.9 dev:api</pre>
+</div>
+
+<h2>3. Background workers <span class="keep-open">keep open</span></h2>
+<div class="terminal">
+  <div class="label">Terminal 3</div>
+  <pre>cd C:\Users\leach\myfamipedia
+npx pnpm@9.15.9 workers</pre>
+  <p class="note">Handles async jobs (transcription, notifications, scheduled prompts, etc.). Optional if you're only testing screens that don't touch those jobs, but leave it running normally.</p>
+</div>
+
+<h2>4. Web app <span class="keep-open">keep open</span></h2>
+<div class="terminal">
+  <div class="label">Terminal 4</div>
+  <pre>cd C:\Users\leach\myfamipedia
+npx pnpm@9.15.9 dev:web</pre>
+  <p class="note">Vite will print the local URL (usually <code>http://localhost:5173</code>).</p>
+</div>
+
+<h2>5. Mobile app <span class="keep-open">keep open</span></h2>
+<div class="terminal">
+  <div class="label">Terminal 5 — run from apps\mobile</div>
+  <pre>cd C:\Users\leach\myfamipedia\apps\mobile
+npx expo start -c</pre>
+  <p class="note">The <code>-c</code> clears Expo/Metro's bundler cache — always use it after dependency changes or when a fix doesn't seem to take effect. Scan the QR code with Expo Go, or press <code>a</code> / <code>i</code> for an emulator.</p>
+</div>
+
+<h2>Shutting down</h2>
+<p class="note">Ctrl+C in each terminal (4, 3, 2), then stop the Docker containers if you want. Terminal 1 (migrations) doesn't need stopping — it already exited on its own.</p>
+
+<h2>One-time setup note</h2>
+<p class="note"><code>pnpm</code> isn't on this machine's PATH directly — all commands above go through <code>npx pnpm@9.15.9</code>. To skip that prefix everywhere (including inside <code>expo install</code>, which invokes <code>pnpm</code> directly and fails without it), run <code>npm install -g pnpm@9.15.9</code> once.</p>
+
+</body>
+</html>
