@@ -7,6 +7,28 @@ import { embeddingQueue } from "../jobs/queue";
 
 export const personsRouter = Router();
 
+// Shared by /persons/:id/timeline and /persons/:id/memories: a memory
+// belongs on profileId's page if profileId is *tagged* on it via
+// memory_persons — that's the actual subject. contributor_id is who typed
+// it in, which is very often a different person (a parent writing on their
+// kid's profile, an admin writing about a deceased relative) and must not
+// be treated as "this profile's memory" on its own — that was the bug: a
+// memory Tim wrote on Juliette's profile (memory_persons -> Juliette,
+// contributor_id -> Tim) was also showing up on Tim's own profile because
+// the old query OR'd in contributor_id unconditionally.
+// The one place contributor_id still counts is a memory with NO
+// memory_persons rows at all (currently only possible via
+// collection.routes.ts's proposed-photo accept path, which doesn't tag a
+// subject yet) — those still surface on the contributor's own profile
+// rather than vanishing entirely.
+function belongsToProfile(qb: import("knex").Knex.QueryBuilder, trx: import("knex").Knex, profileId: string) {
+  qb.where("memory_persons.person_id", profileId).orWhere((qb2) => {
+    qb2
+      .where("memories.contributor_id", profileId)
+      .whereNotExists(trx("memory_persons as mp_any").whereRaw("mp_any.memory_id = memories.id"));
+  });
+}
+
 personsRouter.post("/persons/:id/administrator/nominate", requireAuth, notImplemented("docs/api_structure.md#auth--session"));
 personsRouter.post("/persons/:id/administrator/confirm", requireAuth, notImplemented("docs/api_structure.md#auth--session"));
 
@@ -128,8 +150,8 @@ personsRouter.get("/persons/:id/summary", requireAuth, async (req: AuthedRequest
   }
 });
 
-// Dated events, voice-recording flags. Built from this person's memories
-// (contributed by them, or featuring them via memory_persons) that carry a
+// Dated events, voice-recording flags. Built from memories tagging this
+// person via memory_persons (see belongsToProfile above) that carry a
 // date — the profile timeline is a date-ordered projection of the same
 // memories the feed below shows, not a separate table.
 personsRouter.get("/persons/:id/timeline", requireAuth, async (req: AuthedRequest, res, next) => {
@@ -139,7 +161,7 @@ personsRouter.get("/persons/:id/timeline", requireAuth, async (req: AuthedReques
       trx("memories")
         .distinct("memories.*")
         .leftJoin("memory_persons", "memory_persons.memory_id", "memories.id")
-        .where((qb) => qb.where("memories.contributor_id", req.params.id).orWhere("memory_persons.person_id", req.params.id))
+        .where((qb) => belongsToProfile(qb, trx, req.params.id))
         .whereNotNull("memories.event_date")
         .orderBy("memories.event_date", "asc")
     );
@@ -149,8 +171,20 @@ personsRouter.get("/persons/:id/timeline", requireAuth, async (req: AuthedReques
   }
 });
 
-// Paginated memories feed for this profile — contributed by this person, or
-// featuring them. `?page=`/`?pageSize=` both optional, default 20/page.
+// Paginated memories feed for this profile — memories tagging this person
+// via memory_persons (see belongsToProfile above), i.e. memories *about*
+// them, not just written by them. `?page=`/`?pageSize=` both optional,
+// default 20/page.
+//
+// `?asContributor=true` switches to a different question entirely: not
+// "what's this profile's life story" but "what has this person contributed,
+// regardless of who it's about" — a strict `contributor_id = :id` match,
+// memory_persons ignored. That's what collection/manage.tsx's "Your
+// memories" screen needs: it lists things the caller can retract/delete,
+// which is a contributor right (see docs/data_model.md's deletion policy),
+// not a subject right. Using belongsToProfile there instead would hide a
+// memory like "Tim wrote this on Juliette's profile" from Tim's own manage
+// screen, even though Tim is the one who can retract it.
 //
 // `?excludeVoice=true` drops provenance_type = 'voice' rows. Both "Share a
 // memory / talk about your life" and "Q & A" on mobile's Share your story
@@ -161,22 +195,24 @@ personsRouter.get("/persons/:id/timeline", requireAuth, async (req: AuthedReques
 // Feed (apps/mobile person/[id]/index.tsx, apps/web person/[id]/index.tsx)
 // should only show memories someone specifically chose to enter (text via
 // AddMemoryForm, or an accepted photo proposal) — not raw Q&A/story
-// recordings — so those callers pass excludeVoice=true. This route is also
-// reused by collection/manage.tsx's "Your memories" screen, which still
-// needs voice memories listed (it's the only place you can retract one), so
-// the default stays false rather than filtering unconditionally.
+// recordings — so those callers pass excludeVoice=true. collection/manage.tsx
+// still needs voice memories listed (it's the only place you can retract
+// one), so the default stays false rather than filtering unconditionally.
 personsRouter.get("/persons/:id/memories", requireAuth, async (req: AuthedRequest, res, next) => {
   try {
     const { personId, familyGroupId } = req.auth!;
     const page = Math.max(1, Number(req.query.page) || 1);
     const pageSize = Math.min(100, Number(req.query.pageSize) || 20);
     const excludeVoice = req.query.excludeVoice === "true";
+    const asContributor = req.query.asContributor === "true";
 
     const items = await withRlsContext({ personId, familyGroupId }, (trx) => {
       let q = trx("memories")
         .distinct("memories.*")
         .leftJoin("memory_persons", "memory_persons.memory_id", "memories.id")
-        .where((qb) => qb.where("memories.contributor_id", req.params.id).orWhere("memory_persons.person_id", req.params.id));
+        .where((qb) =>
+          asContributor ? qb.where("memories.contributor_id", req.params.id) : belongsToProfile(qb, trx, req.params.id)
+        );
       if (excludeVoice) {
         q = q.whereNot("memories.provenance_type", "voice");
       }

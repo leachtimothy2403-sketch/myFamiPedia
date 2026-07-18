@@ -1,6 +1,7 @@
-import { View, Text, Button, FlatList, Alert } from "react-native";
+import { View, Text, Button, FlatList, Alert, ActivityIndicator } from "react-native";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiClient } from "../../lib/apiClient";
+import { useSessionIds } from "../../lib/useSessionIds";
 
 interface ManagedMemory {
   id: string;
@@ -16,20 +17,34 @@ interface ManagedMemory {
 // plain "Delete"; anything linked/reacted gets "Retract" instead; posthumous
 // contributions get neither (they route to flags/moderation); voice memories
 // only ever show "Retract".
+//
+// Was GET /persons/me/memories — "me" isn't a real person id, and this
+// route (apps/api's persons.routes.ts) queries Postgres with
+// req.params.id directly (`.where("memories.contributor_id", req.params.id)`
+// against a UUID column), so this screen would 500 rather than load,
+// unlike the self-only routes elsewhere that at least 403 cleanly. Fixed
+// the same way as today's other "me" bugs.
 export default function CollectionManageScreen() {
   const qc = useQueryClient();
-  const { data } = useQuery({
-    queryKey: ["my-memories"],
-    queryFn: () => apiClient.request<{ items: ManagedMemory[] }>("/persons/me/memories"),
+  const { personId, loading: sessionLoading } = useSessionIds();
+  // asContributor=true: this screen manages what YOU contributed
+  // (retract/delete rights are a contributor thing, per data_model.md's
+  // deletion policy), regardless of who the memory is tagged to — not
+  // "memories about you", which is what this endpoint returns by default.
+  // See the route's comment in apps/api/src/routes/persons.routes.ts.
+  const { data, isLoading } = useQuery({
+    queryKey: ["my-memories", personId],
+    queryFn: () => apiClient.request<{ items: ManagedMemory[] }>(`/persons/${personId}/memories?asContributor=true`),
+    enabled: Boolean(personId),
   });
 
   const del = useMutation({
     mutationFn: (id: string) => apiClient.deleteMemory(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["my-memories"] }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["my-memories", personId] }),
   });
   const retract = useMutation({
     mutationFn: (id: string) => apiClient.retractMemory(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["my-memories"] }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["my-memories", personId] }),
   });
 
   function actionFor(m: ManagedMemory) {
@@ -51,6 +66,14 @@ export default function CollectionManageScreen() {
       );
     }
     return <Button title="Retract" onPress={() => retract.mutate(m.id)} />;
+  }
+
+  if (sessionLoading || isLoading) {
+    return (
+      <View style={{ flex: 1, alignItems: "center", justifyContent: "center" }}>
+        <ActivityIndicator />
+      </View>
+    );
   }
 
   return (

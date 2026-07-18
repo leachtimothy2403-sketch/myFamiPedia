@@ -135,6 +135,74 @@ describe("persons", () => {
       expect(res.body.items[0].content).toBe("About user");
     });
 
+    it("does NOT show a memory on the contributor's own profile when it's tagged to someone else (e.g. a parent writing on a child's profile)", async () => {
+      const [child] = await ctx
+        .knex()("persons")
+        .insert({ family_group_id: user.familyGroupId, name: "Child", status: "active" })
+        .returning("*");
+      const [memory] = await ctx
+        .knex()("memories")
+        .insert({
+          family_group_id: user.familyGroupId,
+          contributor_id: user.personId,
+          content: "Ate a good breakfast",
+          provenance_type: "text",
+          event_date: "2026-07-18",
+        })
+        .returning("*");
+      await ctx.knex()("memory_persons").insert({ memory_id: memory.id, person_id: child.id });
+
+      const ownMemories = await ctx
+        .request()
+        .get(`/api/v1/persons/${user.personId}/memories`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(ownMemories.body.items).toHaveLength(0);
+
+      const ownTimeline = await ctx
+        .request()
+        .get(`/api/v1/persons/${user.personId}/timeline`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(ownTimeline.body.items).toHaveLength(0);
+
+      const childMemories = await ctx
+        .request()
+        .get(`/api/v1/persons/${child.id}/memories`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(childMemories.body.items).toHaveLength(1);
+      expect(childMemories.body.items[0].content).toBe("Ate a good breakfast");
+
+      const childTimeline = await ctx
+        .request()
+        .get(`/api/v1/persons/${child.id}/timeline`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(childTimeline.body.items).toHaveLength(1);
+
+      // But collection/manage.tsx's "Your memories" screen still needs to
+      // find it under the contributor's own id, since Tim is the one who
+      // can retract/delete it.
+      const ownAsContributor = await ctx
+        .request()
+        .get(`/api/v1/persons/${user.personId}/memories?asContributor=true`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(ownAsContributor.body.items).toHaveLength(1);
+      expect(ownAsContributor.body.items[0].content).toBe("Ate a good breakfast");
+    });
+
+    it("still shows an untagged memory on the contributor's own profile (e.g. today's accepted-photo-proposal stub, which doesn't tag a subject)", async () => {
+      await ctx.knex()("memories").insert({
+        family_group_id: user.familyGroupId,
+        contributor_id: user.personId,
+        content: null,
+        provenance_type: "photo",
+      });
+      const res = await ctx
+        .request()
+        .get(`/api/v1/persons/${user.personId}/memories`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(200);
+      expect(res.body.items).toHaveLength(1);
+    });
+
     it("paginates the memories feed", async () => {
       const rows = Array.from({ length: 5 }, (_, i) => ({
         family_group_id: user.familyGroupId,
