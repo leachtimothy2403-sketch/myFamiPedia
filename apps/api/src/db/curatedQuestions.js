@@ -29,6 +29,22 @@
 // UNTOUCHED by the migration — only life_phase gets re-tagged onto the new
 // taxonomy, since real answered history may already reference these rows by
 // id. Everything in EXPANSION is new as of this date, sort_order 16 on.
+//
+// 2026-07-19, later the same day — three more added (SENSORY_AND_SPECIFICS
+// below, sort_order 46-48) after the persona eval's grading pass on a full
+// 90-question run flagged real, concrete, easy-to-ask facts that never came
+// up because no curated question ever invited them: a rescued-stray-cat
+// childhood story, named specific likes/dislikes, and a sensory
+// smell/taste/sound memory. Not persona-specific padding — asking about a
+// childhood pet/animal and a sensory-triggered memory are standard oral-
+// history interview techniques for surfacing concrete, colorful detail a
+// purely thematic question ("what belief guided you") tends to skip past.
+// Deliberately NOT trying to fix the eval's other two callouts (Kessler's
+// shoplifting-spotting skill, the switchboard job, each only mentioned once)
+// with a curated question — those are "go deeper on one thing already
+// mentioned" requests, which is exactly the drill-into-one-memory pattern
+// docs/handover_2026-07-17-adaptive-qa-round2.md's "Tour de France" fixation
+// bug taught this system to avoid; see claude.service.ts's docstring.
 const ORIGINAL_FIFTEEN = [
   // Original life_phase values in comments — see the migration for the
   // re-tagging mapping onto the categories below.
@@ -82,6 +98,15 @@ const EXPANSION = [
   ["legacy", "What do you feel most grateful for when you look back on your life as a whole?"],
 ];
 
+// 2026-07-19, later the same day — see the dated comment above ORIGINAL_FIFTEEN
+// for why these exist. sort_order 46-48, additive via migration 024 the same
+// way EXPANSION was added via migration 023.
+const SENSORY_AND_SPECIFICS = [
+  ["childhood", "Was there a pet or animal that mattered to you at some point in your life — is there a story behind it?"],
+  ["passions", "Is there a specific smell, taste, or sound that instantly takes you back to another time in your life?"],
+  ["passions", "Are there things you love or can't stand — foods, sounds, situations — that say something about who you are?"],
+];
+
 // The full set of valid life-story categories a curated OR generated
 // question can belong to — shared with claude.service.ts's follow-up
 // generator so it always picks from this same list, and so
@@ -108,4 +133,4 @@ const INTERVIEW_CATEGORIES = [
   "legacy",
 ];
 
-module.exports = { ORIGINAL_FIFTEEN, EXPANSION, INTERVIEW_CATEGORIES };
+module.exports = { ORIGINAL_FIFTEEN, EXPANSION, SENSORY_AND_SPECIFICS, INTERVIEW_CATEGORIES };

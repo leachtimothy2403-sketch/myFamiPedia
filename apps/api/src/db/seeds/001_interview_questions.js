@@ -8,12 +8,14 @@
 //
 // Question data itself lives in ../curatedQuestions.js, shared with that
 // migration so the two can't drift apart. See that file's header for the
-// full rationale behind the 15 -> 45 expansion.
-const { ORIGINAL_FIFTEEN, EXPANSION } = require("../curatedQuestions");
+// full rationale behind the 15 -> 45 expansion, and for SENSORY_AND_SPECIFICS
+// (45 -> 48, migrations/024_add_sensory_and_specifics_questions.js is the
+// additive path for an already-seeded real database).
+const { ORIGINAL_FIFTEEN, EXPANSION, SENSORY_AND_SPECIFICS } = require("../curatedQuestions");
 
 exports.seed = async function (knex) {
   await knex("interview_questions").del();
-  const rows = [...ORIGINAL_FIFTEEN, ...EXPANSION];
+  const rows = [...ORIGINAL_FIFTEEN, ...EXPANSION, ...SENSORY_AND_SPECIFICS];
   await knex("interview_questions").insert(
     rows.map(([life_phase, text], i) => ({ life_phase, text, sort_order: i + 1 }))
   );
