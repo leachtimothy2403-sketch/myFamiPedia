@@ -11,6 +11,11 @@ interface ClusterablePhoto {
   taken_at: Date;
   location: { lat: number; lng: number } | null;
   uploaded_by: string;
+  face_count: number;
+  // null = not yet in any cluster. Present so a single grouping pass can
+  // tell "this chain is entirely new" apart from "this chain already
+  // includes photos from an existing cluster" — see processClusterJob.
+  existing_cluster_id: string | null;
 }
 
 // Tuning knobs (design doc section 6, explicitly flagged there as "need real
@@ -68,22 +73,111 @@ function groupPhotos(photos: ClusterablePhoto[]): ClusterablePhoto[][] {
 // un-clustered backlog. Pure EXIF-metadata arithmetic (timestamp + GPS), no
 // image content ever touched — the deliberate contrast with the two-stage
 // classification pipeline in sceneClassification.worker.ts.
+// 2026-07-19 fix — extend-or-create. Every earlier version of this job only
+// ever *created* clusters from photos that weren't in one yet, which sounds
+// right but has a sharp edge: face detection lands asynchronously, often
+// well after photos are registered, and each detection re-triggers a
+// clustering pass (faceDetection.worker.ts). If a pass ran while only *some*
+// of a real event's photos had a face detected yet, it would lock those few
+// into a cluster on the strength of the face-count gate below — and because
+// clustering never looked at already-clustered photos again, the rest of
+// that same event's photos (registered or face-detected moments later)
+// could only ever form a *second, separate* cluster once their own turn
+// came, silently splitting one real event into two review-queue cards. This
+// isn't hypothetical — it happened on a live 90-photo sync. Same root cause,
+// different trigger, as the earlier chunked-registration split fix; this
+// version fixes the general case instead of just that one trigger.
+//
+// The fix: a grouping pass now considers ALL taken_at-chainable photos,
+// already-clustered or not, together. A chain that turns out to include
+// photos from exactly one existing cluster gets its new members *added* to
+// that cluster instead of spawning a new one. A chain that's entirely new
+// still goes through the face-count gate as before (existing clusters don't
+// re-gate — they already passed it once). A chain that happens to span two
+// *different* pre-existing clusters (a genuine merge case) is left alone —
+// rare, and reconciling two already-surfaced review cards into one is a
+// bigger decision than this job should make silently.
 export async function processClusterJob(data: ClusterJobData) {
   const { familyGroupId } = data;
 
+  // 2026-07-19 fix — excludes photos that already have their own pending
+  // single-photo proposal (stage 2 classification, sceneClassificationReview.worker.ts,
+  // is a completely separate path into proposed_memories from this one).
+  // Before this, the same photo could generate two review-queue cards at
+  // once — its own classification-sourced card AND a cluster-sourced card
+  // once it got swept into an "outing" with its siblings — showing up
+  // twice for the same real event. Scoped to status = 'pending' rather than
+  // excluding permanently: a photo whose individual proposal was already
+  // accepted or rejected shouldn't keep blocking it from ever joining a
+  // cluster with unrelated later photos.
   const candidates = await withServiceContext((trx) =>
     trx("photos as p")
       .leftJoin("photo_cluster_photos as pcp", "pcp.photo_id", "p.id")
+      .leftJoin("proposed_memories as pm", function () {
+        this.on("pm.photo_id", "=", "p.id").andOnVal("pm.status", "=", "pending");
+      })
       .where("p.family_group_id", familyGroupId)
-      .whereNull("pcp.photo_id")
+      .whereNull("pm.photo_id")
       .whereNotNull("p.taken_at")
-      .select("p.id", "p.taken_at", "p.location", "p.uploaded_by")
+      .select("p.id", "p.taken_at", "p.location", "p.uploaded_by", "p.face_count", "pcp.cluster_id as existing_cluster_id")
   );
 
   const groups = groupPhotos(candidates as ClusterablePhoto[]);
   const clusterIds: string[] = [];
+  const extendedClusterIds: string[] = [];
 
   for (const group of groups) {
+    const newMembers = group.filter((p) => !p.existing_cluster_id);
+    if (newMembers.length === 0) continue; // fully already persisted (or an unresolved multi-cluster span) — nothing to do
+
+    const existingClusterIds = [...new Set(group.map((p) => p.existing_cluster_id).filter((id): id is string => id !== null))];
+
+    if (existingClusterIds.length > 1) continue; // spans two different pre-existing clusters — a merge decision, not this job's call
+
+    if (existingClusterIds.length === 1) {
+      // Extend: these new photos chain directly onto an already-surfaced
+      // cluster. It already passed the face-count gate when first created —
+      // adding more of the same event's photos doesn't need to re-earn that.
+      const clusterId = existingClusterIds[0];
+      await withServiceContext(async (trx) => {
+        await trx("photo_cluster_photos").insert(newMembers.map((p) => ({ cluster_id: clusterId, photo_id: p.id })));
+
+        // A newly-joining photo might belong to an uploader who wasn't part
+        // of the cluster before — give them a review card for it too,
+        // same "one proposal per distinct uploader" rule as cluster
+        // creation below, but only for uploaders who don't already have one
+        // for this specific cluster.
+        const existingProposalUploaders = new Set(
+          (await trx("proposed_memories").where({ cluster_id: clusterId }).select("person_id")).map(
+            (r: { person_id: string }) => r.person_id
+          )
+        );
+        const newUploaderIds = [...new Set(newMembers.map((p) => p.uploaded_by))].filter(
+          (id) => !existingProposalUploaders.has(id)
+        );
+        if (newUploaderIds.length > 0) {
+          await trx("proposed_memories").insert(newUploaderIds.map((personId) => ({ person_id: personId, cluster_id: clusterId })));
+        }
+      });
+      extendedClusterIds.push(clusterId);
+      continue;
+    }
+
+    // 2026-07-19 fix — a group of photographed documents/maps/receipts
+    // (nobody in any of them) was clustering exactly like a real outing,
+    // since clustering only ever looked at timestamp/GPS. face_count is
+    // already computed for every photo independently (faceDetection.worker.ts),
+    // at no extra cost — requiring at least one member of the group to have
+    // a detected face is a much sharper "is this a personal photo at all"
+    // signal than trying to curate a label blocklist. Explicit tradeoff
+    // accepted: a genuine outing where literally nobody appears in any photo
+    // (pure scenery, an empty table setting) won't surface via clustering
+    // either. Skipping rather than discarding — these photos stay
+    // unclustered and get reconsidered the next time clustering runs, e.g.
+    // once face detection lands for one of them (see the re-trigger in
+    // faceDetection.worker.ts) or a later photo joins the chain.
+    if (!group.some((p) => p.face_count > 0)) continue;
+
     const representativeTakenAt = group[Math.floor(group.length / 2)].taken_at;
     const withLocation = group.filter((p) => p.location);
     const centroid =
@@ -119,7 +213,7 @@ export async function processClusterJob(data: ClusterJobData) {
     });
   }
 
-  return { familyGroupId, clustersCreated: clusterIds.length, clusterIds };
+  return { familyGroupId, clustersCreated: clusterIds.length, clusterIds, clustersExtended: extendedClusterIds };
 }
 
 export const photoClusteringWorker = new Worker(
