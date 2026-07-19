@@ -32,3 +32,12 @@ export const sceneClassificationReviewQueue = new Queue("scene-classification-re
 // triggered after each camera-roll sync rather than only via Q_CRON (pure
 // metadata arithmetic, cheap enough to run more often than daily).
 export const photoClusteringQueue = new Queue("photo-clustering", { connection });
+// 2026-07-20 — folds freeform memories (share-a-memory, and captions added
+// to photo-sourced memories) into the same running per-category biography
+// Q&A answers already build (biography.service.ts). Its own queue rather
+// than piggybacking on embeddingQueue: both fire from the same
+// memories.routes.ts moment (content becoming non-empty), but "classify
+// this memory's life category and fold it into a biography section" is a
+// distinct job family from "compute a semantic-search embedding," same
+// one-queue-per-job-family convention as every other queue here.
+export const memoryBiographyQueue = new Queue("memory-biography", { connection });

@@ -509,3 +509,88 @@ describe("claude.service — synthesizeBiography", () => {
     expect(capturedPrompt).not.toContain("work:");
   });
 });
+
+// 2026-07-20 — classifies a freeform memory (share-a-memory, or a caption
+// added to a photo-sourced memory — see memoryBiography.worker.ts) into one
+// of the eighteen interview categories so it can be folded into the same
+// running biography Q&A answers already build. A freeform memory has no
+// question_id to trace a category back through the way an interview answer
+// does, so something has to guess.
+describe("claude.service — classifyMemoryCategory", () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    const { env } = await import("../../src/config/env");
+    env.anthropicApiKey = "test-key";
+  });
+
+  it("throws a clear, catchable error when ANTHROPIC_API_KEY is not configured", async () => {
+    const { env } = await import("../../src/config/env");
+    env.anthropicApiKey = "";
+    const { classifyMemoryCategory } = await import("../../src/services/claude.service");
+    await expect(classifyMemoryCategory("We lived two streets from the rail yard.")).rejects.toThrow(/ANTHROPIC_API_KEY/);
+  });
+
+  it("returns the category Claude picks", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({ content: [{ type: "text", text: "childhood" }] }) }))
+    );
+    const { classifyMemoryCategory } = await import("../../src/services/claude.service");
+    const result = await classifyMemoryCategory("We lived two streets from the rail yard.");
+    expect(result).toBe("childhood");
+  });
+
+  // Same tolerance generateFollowUpQuestion's CATEGORY line already needs —
+  // a model response isn't guaranteed to come back in exactly the requested
+  // casing/whitespace.
+  it("normalizes case and trailing punctuation/whitespace before matching", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({ content: [{ type: "text", text: "  Childhood.\n" }] }) }))
+    );
+    const { classifyMemoryCategory } = await import("../../src/services/claude.service");
+    const result = await classifyMemoryCategory("We lived two streets from the rail yard.");
+    expect(result).toBe("childhood");
+  });
+
+  it("returns null for Claude's explicit NONE response (too vague to categorize)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({ content: [{ type: "text", text: "NONE" }] }) }))
+    );
+    const { classifyMemoryCategory } = await import("../../src/services/claude.service");
+    const result = await classifyMemoryCategory("Beach day!");
+    expect(result).toBeNull();
+  });
+
+  it("returns null rather than throwing when the response doesn't parse into a known category", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({ content: [{ type: "text", text: "not-a-real-category" }] }) }))
+    );
+    const { classifyMemoryCategory } = await import("../../src/services/claude.service");
+    const result = await classifyMemoryCategory("Something ambiguous.");
+    expect(result).toBeNull();
+  });
+
+  it("includes the memory content and the full category list in the prompt", async () => {
+    let capturedPrompt = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: { body: string }) => {
+        capturedPrompt = JSON.parse(init.body).messages[0].content as string;
+        return { ok: true, json: async () => ({ content: [{ type: "text", text: "work" }] }) };
+      })
+    );
+    const { classifyMemoryCategory } = await import("../../src/services/claude.service");
+    await classifyMemoryCategory("Worked at Kessler's Department Store as a teenager.");
+    expect(capturedPrompt).toContain("Worked at Kessler's Department Store as a teenager.");
+    expect(capturedPrompt).toContain("origins");
+    expect(capturedPrompt).toContain("legacy");
+    expect(capturedPrompt).toContain("NONE");
+  });
+});

@@ -107,6 +107,35 @@ describe("memories", () => {
         .send({ content: "No date given", provenanceType: "text", eventDate: null });
       expect(res.status).toBe(201);
     });
+
+    // 2026-07-20 — memoryBiography.worker.ts: a memory with real content
+    // gets folded into the running biography the same way a Q&A answer
+    // does, via a queued job (classification + the actual summary rewrite
+    // are both Claude calls, kept off the request's critical path).
+    it("enqueues a biography update when content is present", async () => {
+      getQueueMock("memoryBiographyQueue").add.mockClear();
+      const res = await ctx
+        .request()
+        .post("/api/v1/memories")
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ content: "Grew up two streets from the rail yard", provenanceType: "text" });
+      expect(res.status).toBe(201);
+      expect(getQueueMock("memoryBiographyQueue").add).toHaveBeenCalledWith("update-biography", { memoryId: res.body.id });
+    });
+
+    // A photo-sourced memory created with no content yet (collection.routes.ts's
+    // accept flow) has nothing to classify — PATCH /memories/:id below is
+    // where this job gets enqueued instead, once/if a caption is added.
+    it("does not enqueue a biography update when there's no content to classify", async () => {
+      getQueueMock("memoryBiographyQueue").add.mockClear();
+      const res = await ctx
+        .request()
+        .post("/api/v1/memories")
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ mediaUrl: "https://example.com/photo.jpg", provenanceType: "photo" });
+      expect(res.status).toBe(201);
+      expect(getQueueMock("memoryBiographyQueue").add).not.toHaveBeenCalled();
+    });
   });
 
   // Closes the gap docs/media_pipeline.md flagged: accepting a proposed
@@ -137,6 +166,34 @@ describe("memories", () => {
       expect(res.status).toBe(200);
       expect(res.body.event_date).toContain("2026-07-16");
       expect(getQueueMock("embeddingQueue").add).not.toHaveBeenCalled();
+    });
+
+    // 2026-07-20 — this is the actual trigger point for a photo-sourced
+    // memory (created via collection.routes.ts's accept flow with
+    // content: null) to ever reach the biography at all: it has nothing to
+    // classify until a caption gets added here.
+    it("enqueues a biography update when a caption/content is added to a previously-empty memory", async () => {
+      getQueueMock("memoryBiographyQueue").add.mockClear();
+      const memory = await createMemory({ content: null, provenance_type: "photo" });
+      const res = await ctx
+        .request()
+        .patch(`/api/v1/memories/${memory.id}`)
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ content: "The whole family at the lake house, summer of '82" });
+      expect(res.status).toBe(200);
+      expect(getQueueMock("memoryBiographyQueue").add).toHaveBeenCalledWith("update-biography", { memoryId: memory.id });
+    });
+
+    it("does not enqueue a biography update for an eventDate-only edit", async () => {
+      getQueueMock("memoryBiographyQueue").add.mockClear();
+      const memory = await createMemory();
+      const res = await ctx
+        .request()
+        .patch(`/api/v1/memories/${memory.id}`)
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ eventDate: "2026-07-16" });
+      expect(res.status).toBe(200);
+      expect(getQueueMock("memoryBiographyQueue").add).not.toHaveBeenCalled();
     });
 
     it("rejects a malformed eventDate with a clean 400", async () => {

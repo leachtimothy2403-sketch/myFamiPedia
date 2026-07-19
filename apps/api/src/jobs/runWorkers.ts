@@ -10,6 +10,7 @@ import "./scheduledJobs.worker";
 import "./sceneClassification.worker";
 import "./sceneClassificationReview.worker";
 import "./photoClustering.worker";
+import "./memoryBiography.worker";
 import { cronQueue } from "./queue";
 
 // Schedules the Q_CRON daily sweep (docs/invitation_flow.md, docs/section2_pipeline.md)

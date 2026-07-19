@@ -1,6 +1,12 @@
 import type { Knex } from "knex";
 import { updateBiographySectionSummary } from "./claude.service";
 
+// Longest excerpt kept in a memory-derived asked_question_stems entry (see
+// recordMemoryInBiography below) — long enough to be recognizable, short
+// enough not to bloat the "already asked in this category" prompt text
+// generateFollowUpQuestion shows the model.
+const MEMORY_STEM_EXCERPT_LENGTH = 60;
+
 // DB orchestration for interview_biography_sections (migration 026) —
 // claude.service.ts stays a pure API-calling module, same convention as
 // generateFollowUpQuestion; this file does the reads/writes and calls that
@@ -70,6 +76,43 @@ export async function recordAnswerInBiography(
       question_count: 1,
     });
   }
+}
+
+// Companion to recordAnswerInBiography, for content that reaches the
+// biography from outside the Q&A interview flow entirely: a memory shared
+// directly, or a caption added later to a photo-sourced memory (both via
+// memories.routes.ts — see memoryBiography.worker.ts, the only caller,
+// which figures out the life_phase via claude.service.ts's
+// classifyMemoryCategory first since a freeform memory has no question_id
+// to trace a category back through the way an interview answer does).
+//
+// A memory has no real "question" behind it, so this can't just pass a
+// fixed placeholder string through to recordAnswerInBiography's `question`
+// param — asked_question_stems isn't only display text (the "already asked
+// in this category" list generateFollowUpQuestion's prompt shows), its
+// LENGTH is also what claude.service.ts's tallyCategoryCounts reads as the
+// whole-interview category tally that drives category-pacing. A fixed
+// placeholder would dedupe every memory in a category down to one stem
+// (recordAnswerInBiography only appends a stem if it isn't already present)
+// and silently undercount how much that category has actually covered.
+// Using a short excerpt of the memory's own content keeps each one distinct.
+export async function recordMemoryInBiography(
+  trx: Knex.Transaction | Knex,
+  params: { personId: string; personName: string; lifePhase: string; content: string }
+): Promise<void> {
+  const excerpt =
+    params.content.length > MEMORY_STEM_EXCERPT_LENGTH
+      ? `${params.content.slice(0, MEMORY_STEM_EXCERPT_LENGTH)}…`
+      : params.content;
+  const stem = `(memory shared: "${excerpt}")`;
+
+  await recordAnswerInBiography(trx, {
+    personId: params.personId,
+    personName: params.personName,
+    lifePhase: params.lifePhase,
+    question: stem,
+    answer: params.content,
+  });
 }
 
 // Read side — generateFollowUpQuestion's biographySections input

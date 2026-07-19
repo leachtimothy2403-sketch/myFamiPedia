@@ -33,6 +33,9 @@ export function mockQueues() {
     fakeQueues.sceneClassificationQueue = fakeQueue();
     fakeQueues.sceneClassificationReviewQueue = fakeQueue();
     fakeQueues.photoClusteringQueue = fakeQueue();
+    // memories.routes.ts, 2026-07-20 — folds share-a-memory/photo-caption
+    // content into the running biography (memoryBiography.worker.ts).
+    fakeQueues.memoryBiographyQueue = fakeQueue();
     return { ...fakeQueues, connection: {} };
   });
 }

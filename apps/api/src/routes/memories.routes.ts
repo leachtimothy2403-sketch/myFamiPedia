@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { requireAuth, AuthedRequest, requireFamilyAdministrator } from "../middleware/auth";
 import { withRlsContext } from "../db/pool";
-import { notificationQueue, embeddingQueue } from "../jobs/queue";
+import { notificationQueue, embeddingQueue, memoryBiographyQueue } from "../jobs/queue";
 import { HttpError } from "../utils/httpError";
 import { isValidDate } from "../utils/isValidDate";
 import { presignDownload } from "../services/r2.service";
@@ -104,6 +104,15 @@ memoriesRouter.post("/memories", requireAuth, async (req: AuthedRequest, res, ne
     });
 
     await embeddingQueue.add("embed-memory", { memoryId: memory.id });
+    // 2026-07-20 — folds this memory into the same running per-category
+    // biography Q&A answers already build (see memoryBiography.worker.ts).
+    // Only worth enqueueing when there's actual text to categorize — a
+    // bare photo/mediaUrl memory with no content has nothing to classify
+    // yet (PATCH /memories/:id below enqueues this same job if/when a
+    // caption gets added later).
+    if (memory.content) {
+      await memoryBiographyQueue.add("update-biography", { memoryId: memory.id });
+    }
     res.status(201).json(memory);
   } catch (err) {
     next(err);
@@ -156,6 +165,16 @@ memoriesRouter.patch("/memories/:id", requireAuth, async (req: AuthedRequest, re
     // doesn't touch what semantic search matches against.
     if (content !== undefined) {
       await embeddingQueue.add("embed-memory", { memoryId: memory.id });
+      // Same biography hook as POST /memories above — this is specifically
+      // the trigger point for a photo-sourced memory that started with no
+      // content at all (collection.routes.ts's accept flow) and only gets
+      // real text here, whenever a caption/description is eventually added.
+      // Guarded on the post-update value, not the raw request body value —
+      // an edit that clears content back to null/empty shouldn't enqueue a
+      // classification call over nothing.
+      if (memory.content) {
+        await memoryBiographyQueue.add("update-biography", { memoryId: memory.id });
+      }
     }
     res.json(memory);
   } catch (err) {

@@ -399,6 +399,41 @@ Write a single flowing "who they were" biography, a few warm paragraphs, weaving
   return callAnthropic(prompt, 1200);
 }
 
+// 2026-07-20 — memories.routes.ts's "share a memory directly" (POST
+// /memories) and collection.routes.ts's photo-cluster-accept flow (which
+// only ever gets real text later, via PATCH /memories/:id adding a caption —
+// see memories.routes.ts's own comment on that endpoint) both write into
+// `memories`, which unlike interview_answers has no life_phase at all — a
+// freeform memory was never asked as one of the eighteen categorized
+// interview questions, so there's no question_id to trace a category back
+// through. To fold this content into the same running per-category
+// biography as Q&A answers (biography.service.ts's recordAnswerInBiography),
+// something has to guess the category first. Cheap Haiku classification,
+// same cost tier as classifyPhotoScene below — this is a best-fit lookup,
+// not deep reasoning. Returns null rather than forcing a guess when the
+// content is too thin or general to confidently place (a bare caption like
+// "Beach day!" with nothing else) — callers should skip filing something
+// that vague into a specific biography category rather than mis-file it.
+export async function classifyMemoryCategory(content: string): Promise<InterviewCategory | null> {
+  if (!env.anthropicApiKey) {
+    throw new Error("classifyMemoryCategory is not configured — set ANTHROPIC_API_KEY. See docs/section2_pipeline.md section 4.");
+  }
+
+  const categoryList = INTERVIEW_CATEGORIES.join(", ");
+  const prompt = `Below is a memory someone shared directly in a family history app — not an answer to an interview question, just a freeform memory they chose to record about their own life or a family member's.
+
+"${content}"
+
+Does this memory clearly belong to one of these eighteen life-story categories: ${categoryList}?
+
+If yes, respond with ONLY the category key, exactly as written, lowercase with underscores, nothing else — no punctuation, no explanation.
+If the memory is too short, vague, or general to confidently place in one specific category (for example a bare caption with no real detail), respond with exactly: NONE`;
+
+  const text = await callAnthropic(prompt, 20);
+  const normalized = text.trim().toLowerCase().replace(/[.\s]+$/, "");
+  return isInterviewCategory(normalized) ? normalized : null;
+}
+
 export interface PhotoClassificationResult {
   isCandidateWorthy: boolean;
   suggestedCaption: string | null;
