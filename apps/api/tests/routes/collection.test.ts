@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { withApp, registerTestUser, type TestUser } from "../helpers/withApp";
 import { mockQueues, getQueueMock } from "../helpers/queueMock";
 
@@ -10,6 +10,11 @@ describe("collection", () => {
 
   beforeEach(async () => {
     user = await registerTestUser(ctx.request);
+    // mockQueues() only creates these spies once for the whole file — clear
+    // call history each test or an earlier test's calls bleed into the
+    // next one's assertion (same fix already applied in uploads.test.ts
+    // after hitting this exact issue in an earlier session).
+    getQueueMock("photoClusteringQueue").add.mockClear();
   });
 
   describe("camera-roll sync", () => {
@@ -44,6 +49,47 @@ describe("collection", () => {
         .set("Authorization", `Bearer ${user.accessToken}`)
         .send({ photos: [] });
       expect(res.status).toBe(400);
+    });
+
+    // 2026-07-19 — a client registering one sync session across multiple
+    // chunked calls needs to suppress the per-call clustering pass, or a
+    // single real event straddling a chunk boundary splits into multiple
+    // disjoint clusters (docs/media_pipeline.md).
+    it("skips the clustering enqueue when skipClustering is true", async () => {
+      const res = await ctx
+        .request()
+        .post("/api/v1/collection/camera-roll/sync")
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ photos: [{ r2Key: "a.jpg" }], skipClustering: true });
+      expect(res.status).toBe(201);
+      expect(getQueueMock("photoClusteringQueue").add).not.toHaveBeenCalled();
+    });
+
+    it("still clusters by default when skipClustering is omitted", async () => {
+      const res = await ctx
+        .request()
+        .post("/api/v1/collection/camera-roll/sync")
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ photos: [{ r2Key: "a.jpg" }] });
+      expect(res.status).toBe(201);
+      expect(getQueueMock("photoClusteringQueue").add).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("camera-roll cluster trigger", () => {
+    it("enqueues exactly one deferred clustering pass for the caller's family", async () => {
+      const res = await ctx
+        .request()
+        .post("/api/v1/collection/camera-roll/cluster")
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(202);
+      expect(getQueueMock("photoClusteringQueue").add).toHaveBeenCalledTimes(1);
+      expect(getQueueMock("photoClusteringQueue").add).toHaveBeenCalledWith("cluster", { familyGroupId: user.familyGroupId });
+    });
+
+    it("requires auth", async () => {
+      const res = await ctx.request().post("/api/v1/collection/camera-roll/cluster");
+      expect(res.status).toBe(401);
     });
   });
 
@@ -135,6 +181,61 @@ describe("collection", () => {
       expect(res.status).toBe(200);
       expect(res.body.items).toHaveLength(1);
       expect(res.body.items[0]).toMatchObject({ source: "cluster", caption: null, photoCount: 2 });
+    });
+
+    // 2026-07-19 fix — a real live sync produced a cluster whose
+    // chronologically-earliest photo was a photographed schedule (no
+    // people), even though a later photo in the same cluster had faces
+    // (that's why the cluster passed the face-count gate at all,
+    // photoClustering.worker.ts). The review card showed only the
+    // no-people photo with no indication anything else was in the cluster.
+    // photoUrl itself is always null in this test env (no R2 configured),
+    // so this asserts on safePresignDownload's error log instead — it logs
+    // the exact r2_key it attempted to presign, which is the only
+    // observable signal here of which photo the route actually picked.
+    it("prefers a photo with a detected face as the cluster's representative photo, even when it isn't the earliest", async () => {
+      const [earlierNoFace, laterWithFace] = await Promise.all([
+        ctx
+          .knex()("photos")
+          .insert({
+            family_group_id: user.familyGroupId,
+            r2_key: "schedule-photo.jpg",
+            uploaded_by: user.personId,
+            taken_at: "2024-01-01",
+            face_count: 0,
+          })
+          .returning("*")
+          .then(([p]: { id: string }[]) => p),
+        ctx
+          .knex()("photos")
+          .insert({
+            family_group_id: user.familyGroupId,
+            r2_key: "birthday-photo.jpg",
+            uploaded_by: user.personId,
+            taken_at: "2024-01-02",
+            face_count: 3,
+          })
+          .returning("*")
+          .then(([p]: { id: string }[]) => p),
+      ]);
+      const [cluster] = await ctx.knex()("photo_clusters").insert({ family_group_id: user.familyGroupId }).returning("*");
+      await ctx.knex()("photo_cluster_photos").insert([
+        { cluster_id: cluster.id, photo_id: earlierNoFace.id },
+        { cluster_id: cluster.id, photo_id: laterWithFace.id },
+      ]);
+      await ctx.knex()("proposed_memories").insert({ person_id: user.personId, status: "pending", cluster_id: cluster.id });
+
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const res = await ctx
+        .request()
+        .get("/api/v1/collection/proposed")
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(200);
+
+      const attemptedKeys = errorSpy.mock.calls.map((call) => String(call[0]));
+      expect(attemptedKeys.some((msg) => msg.includes("birthday-photo.jpg"))).toBe(true);
+      expect(attemptedKeys.some((msg) => msg.includes("schedule-photo.jpg"))).toBe(false);
+      errorSpy.mockRestore();
     });
 
     it("accept promotes a photo-sourced proposal to a real memory with its photo attached, and returns memoryId/photoId for the client to navigate into compose", async () => {

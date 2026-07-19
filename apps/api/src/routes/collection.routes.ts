@@ -17,10 +17,25 @@ const spec = "docs/section2_pipeline.md";
 // and — once per sync batch, not once per photo — a re-run of the family's
 // time/location clustering pass, since a fresh batch of photos might extend
 // or form a new "outing" cluster.
+//
+// 2026-07-19 addition — skipClustering. The mobile client
+// (collection/camera-roll-sync.tsx) registers one real device sync in
+// multiple chunks (request-size safety), and this route used to enqueue a
+// clustering pass on every single call. That split a single real event
+// across chunk boundaries into multiple disjoint clusters — clustering only
+// groups photos that are simultaneously present and not yet clustered, so a
+// pass that runs after chunk 1 lands but before chunk 2 does "locks in" a
+// too-small group from chunk 1 alone, and chunk 2's siblings can only ever
+// form a separate, later cluster, never rejoin the first. skipClustering
+// lets a caller register several chunks without triggering an intermediate
+// pass, then fire exactly one clustering pass at the end via
+// POST /collection/camera-roll/cluster once every chunk from that sync
+// session has landed. Defaults to false (unchanged behavior) so existing
+// single-call callers don't need to know this exists.
 collectionRouter.post("/collection/camera-roll/sync", requireAuth, async (req: AuthedRequest, res, next) => {
   try {
     const { personId, familyGroupId } = req.auth!;
-    const { photos } = req.body ?? {};
+    const { photos, skipClustering } = req.body ?? {};
     if (!Array.isArray(photos) || photos.length === 0) {
       return res.status(400).json({ error: "photos (non-empty array) is required" });
     }
@@ -54,9 +69,26 @@ collectionRouter.post("/collection/camera-roll/sync", requireAuth, async (req: A
     // that pass triage, not from here.
     await Promise.all(inserted.map((photo: { id: string }) => sceneClassificationQueue.add("classify", { photoId: photo.id })));
     // Clustering (section 6) is a family-wide batch pass, not per-photo —
-    // one enqueue per sync call regardless of how many photos it contained.
-    await photoClusteringQueue.add("cluster", { familyGroupId });
+    // one enqueue per sync call regardless of how many photos it contained
+    // — unless the caller is chunking one larger sync session and asked to
+    // defer it (see comment above).
+    if (!skipClustering) {
+      await photoClusteringQueue.add("cluster", { familyGroupId });
+    }
     res.status(201).json({ items: inserted });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Dedicated clustering trigger for a caller that registered photos across
+// several skipClustering: true calls (see above) and now wants the deferred
+// pass to actually run, exactly once, after all of them landed.
+collectionRouter.post("/collection/camera-roll/cluster", requireAuth, async (req: AuthedRequest, res, next) => {
+  try {
+    const { familyGroupId } = req.auth!;
+    await photoClusteringQueue.add("cluster", { familyGroupId });
+    res.status(202).json({ enqueued: true });
   } catch (err) {
     next(err);
   }
@@ -123,13 +155,23 @@ collectionRouter.get("/collection/proposed", requireAuth, async (req: AuthedRequ
 
           // Clustering-sourced: no suggested_caption exists (clustering is
           // pure EXIF-metadata arithmetic, section 6 — it never calls
-          // Claude), so caption is always null here. Representative photo is
-          // the earliest by taken_at among the cluster's photos.
+          // Claude), so caption is always null here. Representative photo
+          // prefers one with a detected face over the earliest-by-taken_at
+          // (2026-07-19 fix) — the face-count gate (photoClustering.worker.ts)
+          // only requires ONE photo in the group to have a face, so a
+          // no-people photo (a document, a screenshot that rode along in a
+          // real cluster) could easily be the chronologically-earliest one
+          // and end up as the card's entire visible preview, with no
+          // indication anything else in the cluster was a real photo of
+          // people at all — confusing regardless of whether the cluster
+          // itself is legitimate. Falls back to earliest-by-taken_at when no
+          // photo in the cluster has a face (shouldn't happen post-gate, but
+          // not something to crash over if it does).
           const clusterPhotos = await withRlsContext({ personId, familyGroupId }, (trx) =>
             trx("photo_cluster_photos as pcp")
               .join("photos as p", "p.id", "pcp.photo_id")
               .where("pcp.cluster_id", proposal.cluster_id!)
-              .orderBy("p.taken_at", "asc")
+              .orderByRaw("(p.face_count > 0) DESC, p.taken_at ASC")
               .select("p.r2_key")
           );
           return {
