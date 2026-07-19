@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { withDb } from "../helpers/withDb";
-import { mockQueues } from "../helpers/queueMock";
+import { mockQueues, getQueueMock } from "../helpers/queueMock";
 
 mockQueues();
 import type { VisionService, FaceBox } from "../../src/services/vision.service";
@@ -120,6 +120,41 @@ describe("face-detection worker", () => {
     const knex = ctx.knex();
     expect((await knex("photo_faces").where({ photo_id: photo.id })).length).toBe(0);
     expect((await knex("photos").where({ id: photo.id }).first()).face_count).toBe(0);
+  });
+
+  // 2026-07-19 — clustering now requires at least one photo in a group to
+  // have a detected face (photoClustering.worker.ts's face-count gate,
+  // fixing document/map photos clustering as "memories"). Since face
+  // detection runs async and independently of the clustering pass triggered
+  // at sync time, a group with zero faces detected yet when clustering last
+  // ran needs something to give it a second look once a face does land.
+  it("re-triggers clustering for the photo's family when at least one face is detected", async () => {
+    const { processDetectJob } = await import("../../src/jobs/faceDetection.worker");
+    const { photo } = await seedFamily();
+
+    const vision = fakeVision({
+      detectFaces: vi.fn(async () => [{ boundingBox: { width: 1, height: 1, left: 0, top: 0 }, confidence: 99 }]),
+    });
+    const getBytes = vi.fn(async () => Buffer.from("fake-image-bytes"));
+
+    getQueueMock("photoClusteringQueue").add.mockClear();
+    await processDetectJob({ photoId: photo.id }, { vision, getBytes });
+
+    expect(getQueueMock("photoClusteringQueue").add).toHaveBeenCalledTimes(1);
+    expect(getQueueMock("photoClusteringQueue").add).toHaveBeenCalledWith("cluster", { familyGroupId: photo.family_group_id });
+  });
+
+  it("does not re-trigger clustering when no faces are detected", async () => {
+    const { processDetectJob } = await import("../../src/jobs/faceDetection.worker");
+    const { photo } = await seedFamily();
+
+    const vision = fakeVision({ detectFaces: vi.fn(async () => []) });
+    const getBytes = vi.fn(async () => Buffer.from("fake-image-bytes"));
+
+    getQueueMock("photoClusteringQueue").add.mockClear();
+    await processDetectJob({ photoId: photo.id }, { vision, getBytes });
+
+    expect(getQueueMock("photoClusteringQueue").add).not.toHaveBeenCalled();
   });
 
   it("remove-from-collection calls deleteFaces against the person's family collection", async () => {

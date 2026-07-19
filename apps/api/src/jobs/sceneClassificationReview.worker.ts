@@ -44,12 +44,30 @@ export async function processReviewJob(data: ReviewJobData, deps: SceneClassific
     })
   );
 
+  // 2026-07-19 fix — this half of the duplicate-proposal problem was missed
+  // by the 2026-07-19 clustering-side fix (photoClustering.worker.ts
+  // excludes photos with a pending individual proposal from its candidate
+  // pool). That only guards one direction: it stops clustering from
+  // re-proposing a photo classification already claimed, but nothing
+  // stopped classification from claiming a photo clustering had *already*
+  // swept up. Stage 2 (this job) runs on its own queue, independently timed
+  // from face detection — the trigger for clustering's re-runs
+  // (faceDetection.worker.ts) — and Claude Haiku round-trips are typically
+  // slower than Rekognition DetectFaces, so a photo can easily land in a
+  // cluster before its own classification even finishes. Symptom: the same
+  // event showing up as both an "N photos from this outing" cluster card
+  // and a separate single-photo captioned card for one of its own members.
   let proposalId: string | undefined;
   if (result.isCandidateWorthy) {
-    const [proposal] = await withServiceContext((trx) =>
-      trx("proposed_memories").insert({ person_id: photo.uploaded_by, photo_id: photoId }).returning("id")
+    const alreadyClustered = await withServiceContext((trx) =>
+      trx("photo_cluster_photos").where({ photo_id: photoId }).first()
     );
-    proposalId = proposal.id;
+    if (!alreadyClustered) {
+      const [proposal] = await withServiceContext((trx) =>
+        trx("proposed_memories").insert({ person_id: photo.uploaded_by, photo_id: photoId }).returning("id")
+      );
+      proposalId = proposal.id;
+    }
   }
 
   return { photoId, isCandidateWorthy: result.isCandidateWorthy, proposalId };

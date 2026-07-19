@@ -1,5 +1,5 @@
 import { Worker, Job } from "bullmq";
-import { connection } from "./queue";
+import { connection, photoClusteringQueue } from "./queue";
 import { withServiceContext } from "../db/pool";
 import { getObjectBuffer } from "../services/r2.service";
 import { visionService as defaultVisionService, collectionIdFor, VisionService } from "../services/vision.service";
@@ -61,6 +61,21 @@ export async function processDetectJob(data: DetectJobData, deps: FaceDetectionD
     await trx("photos").where({ id: photoId }).update({ face_count: faces.length });
     return rows.map((r: { id: string }) => r.id);
   });
+
+  // 2026-07-19 — clustering now requires at least one photo in a group to
+  // have a detected face before it'll surface as a proposed memory (see
+  // photoClustering.worker.ts), so document/map/receipt-only clusters with
+  // nobody in any photo stop reaching the review queue. Face detection runs
+  // async and independently of the clustering pass triggered at sync time,
+  // so a group that had zero faces detected yet when clustering last ran
+  // can't retroactively un-suppress itself — re-triggering here, whenever a
+  // photo newly gets a face, is what lets that group get a second look.
+  // Cheap and idempotent either way (clustering only ever acts on photos not
+  // already in a cluster), so this fires on every detection with at least
+  // one face rather than trying to be clever about when it's actually needed.
+  if (faces.length > 0) {
+    await photoClusteringQueue.add("cluster", { familyGroupId: photo.family_group_id });
+  }
 
   return {
     photoId,

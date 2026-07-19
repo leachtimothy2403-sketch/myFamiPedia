@@ -63,6 +63,38 @@ describe("scene-classification-review worker (stage 2)", () => {
     expect(proposals).toHaveLength(0);
   });
 
+  // 2026-07-19 fix — the reverse direction of the duplicate-proposal bug.
+  // photoClustering.worker.ts already excludes photos with a pending
+  // individual proposal from its candidate pool, but nothing stopped this
+  // job from proposing a photo clustering had already claimed — plausible
+  // in practice since face detection (clustering's trigger) and Claude
+  // Haiku classification (this job) run on independently-timed queues.
+  it("does not create a duplicate individual proposal for a photo already swept into a cluster", async () => {
+    const { processReviewJob } = await import("../../src/jobs/sceneClassificationReview.worker");
+    const { photo, group } = await seedClassifiedPhoto();
+
+    const knex = ctx.knex();
+    const [cluster] = await knex("photo_clusters").insert({ family_group_id: group.id }).returning("*");
+    await knex("photo_cluster_photos").insert({ cluster_id: cluster.id, photo_id: photo.id });
+
+    const classify = vi.fn(async (): Promise<PhotoClassificationResult> => ({
+      isCandidateWorthy: true,
+      suggestedCaption: "A birthday celebration",
+    }));
+    const result = await processReviewJob({ photoId: photo.id }, { classify, getBytes: vi.fn(async () => Buffer.from("x")) });
+
+    // The verdict/caption still get written — only the duplicate proposal is skipped.
+    expect(result.isCandidateWorthy).toBe(true);
+    expect(result.proposalId).toBeUndefined();
+
+    const classification = await knex("photo_classifications").where({ photo_id: photo.id }).first();
+    expect(classification.is_candidate_worthy).toBe(true);
+    expect(classification.suggested_caption).toBe("A birthday celebration");
+
+    const proposals = await knex("proposed_memories").where({ photo_id: photo.id });
+    expect(proposals).toHaveLength(0);
+  });
+
   it("throws if stage 1 hasn't run yet for this photo", async () => {
     const knex = ctx.knex();
     const [group] = await knex("family_groups").insert({ name: "Test Family" }).returning("*");
