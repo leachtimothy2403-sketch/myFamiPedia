@@ -4,7 +4,8 @@ import { withRlsContext } from "../db/pool";
 import { transcriptionQueue } from "../jobs/queue";
 import { processTranscribeJob } from "../jobs/transcribeAnswer";
 import { HttpError } from "../utils/httpError";
-import { generateFollowUpQuestion } from "../services/claude.service";
+import { generateFollowUpQuestion, synthesizeBiography } from "../services/claude.service";
+import { getBiographySections } from "../services/biography.service";
 import { env } from "../config/env";
 
 export const interviewsRouter = Router();
@@ -92,20 +93,23 @@ interviewsRouter.get("/interview-questions/next", requireAuth, async (req: Authe
         return null;
       }
 
-      // 2026-07-19 fix — every question ever asked this person, text + life
-      // phase only (no answers, so it stays cheap even on a long interview),
-      // separate from priorAnswers' answer-level detail above which stays
-      // capped at 8 on purpose. See claude.service.ts's docstring: capping
-      // BOTH lists to 8 meant the model lost all memory of anything asked
-      // earlier than the last 8 questions and would re-ask substantively the
-      // same thing — caught by the persona eval on a real 40-question run
-      // (docs/handover_2026-07-19-qa-persona-eval.md).
-      const allAskedQuestions = await trx("interview_answers as ia")
-        .join("interview_sessions as s", "s.id", "ia.session_id")
-        .join("interview_questions as q", "q.id", "ia.question_id")
-        .where({ "s.person_id": subjectPersonId })
-        .orderBy("ia.created_at", "asc")
-        .select("q.text as question_text", "q.life_phase as question_life_phase");
+      // 2026-07-19 fix, superseded 2026-07-19 fourth fix, same day — this
+      // used to be a query for every question ever asked this person (text +
+      // life phase, no answers), passed to generateFollowUpQuestion as
+      // priorQuestionTexts so it wouldn't lose memory of anything asked
+      // earlier than priorAnswers' capped-at-8 window (persona eval, real
+      // 40-question run, docs/handover_2026-07-19-qa-persona-eval.md). That
+      // fixed the duplicate-question problem but grew without any ceiling —
+      // every question, forever, on every single follow-up prompt. Replaced
+      // with the running per-category biography (migration 026,
+      // biography.service.ts): same duplicate-avoidance job (each section
+      // carries its own already-asked question stems), but bounded by how
+      // much there is to say about a category rather than by interview
+      // length. See claude.service.ts's docstring on generateFollowUpQuestion
+      // for the full reasoning (Tim asked what a late-interview follow-up
+      // call actually cost — this is the answer to "how do we bring that
+      // down").
+      const biographySections = await getBiographySections(trx, subjectPersonId);
 
       // 2026-07-19 fix — category spread. Recent-first category sequence
       // (chronological once reversed below) so generateFollowUpQuestion can
@@ -113,9 +117,9 @@ interviewsRouter.get("/interview-questions/next", requireAuth, async (req: Authe
       // the eighteen curated categories and, per Tim's direction after
       // reviewing eval output, deliberately pick something different rather
       // than staying parked on whatever's most recently discussed. A
-      // smaller window than allAskedQuestions above on purpose — this is
-      // about recent momentum, not full history (that's what the
-      // duplicate-avoidance list is for).
+      // smaller window than the biography sections above on purpose — this
+      // is about recent momentum, not full history (that's what each
+      // section's own asked-question-stems list is for).
       const recentCategoryRows = await trx("interview_answers as ia")
         .join("interview_sessions as s", "s.id", "ia.session_id")
         .join("interview_questions as q", "q.id", "ia.question_id")
@@ -132,10 +136,7 @@ interviewsRouter.get("/interview-questions/next", requireAuth, async (req: Authe
           answer: a.answer_text,
           lifePhase: a.question_life_phase,
         })),
-        priorQuestionTexts: allAskedQuestions.map((q: { question_text: string; question_life_phase: string }) => ({
-          question: q.question_text,
-          lifePhase: q.question_life_phase,
-        })),
+        biographySections,
         recentCategories,
       });
 
@@ -255,13 +256,14 @@ interviewsRouter.post("/interview-sessions/:id/answers", requireAuth, async (req
 interviewsRouter.post("/interview-sessions/:id/complete", requireAuth, async (req: AuthedRequest, res, next) => {
   try {
     const { personId, familyGroupId } = req.auth!;
-    const untranscribedAnswers = await withRlsContext({ personId, familyGroupId }, async (trx) => {
+    const { untranscribedAnswers, subjectPersonId } = await withRlsContext({ personId, familyGroupId }, async (trx) => {
       const session = await trx("interview_sessions").where({ id: req.params.id }).first();
       if (!session) throw new HttpError(404, "Interview session not found");
       if (session.status === "completed") throw new HttpError(409, "This session has already been completed");
 
       await trx("interview_sessions").where({ id: session.id }).update({ status: "completed", completed_at: new Date() });
-      return trx("interview_answers").where({ session_id: session.id }).whereNull("transcript");
+      const untranscribedAnswers = await trx("interview_answers").where({ session_id: session.id }).whereNull("transcript");
+      return { untranscribedAnswers, subjectPersonId: session.person_id as string };
     });
 
     await Promise.all(
@@ -269,6 +271,31 @@ interviewsRouter.post("/interview-sessions/:id/complete", requireAuth, async (re
         transcriptionQueue.add("transcribe", { interviewAnswerId: answer.id })
       )
     );
+
+    // 2026-07-19 fourth fix — refresh the "who they were" legacy summary
+    // (persons.ai_summary, GET /persons/:id/summary — see persons.routes.ts,
+    // previously a stub nothing ever wrote to) from the current per-category
+    // biography sections whenever a session wraps up. Built from the
+    // already-compact sections, never the raw transcript, so this stays
+    // cheap regardless of how many sessions this person has done. Non-fatal:
+    // a stale or missing summary is a much smaller problem than failing
+    // session completion over a Claude hiccup — same principle as the
+    // synchronous-transcription try/catch in the /answers handler above.
+    try {
+      await withRlsContext({ personId, familyGroupId }, async (trx) => {
+        const sections = await getBiographySections(trx, subjectPersonId);
+        const nonEmpty = sections.filter((s) => s.summary.trim().length > 0);
+        if (nonEmpty.length === 0) return;
+        const person = await trx("persons").where({ id: subjectPersonId }).first();
+        if (!person) return;
+        const aiSummary = await synthesizeBiography({ personName: person.name, sections: nonEmpty });
+        await trx("persons").where({ id: subjectPersonId }).update({ ai_summary: aiSummary, updated_at: new Date() });
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(`[interviews] biography synthesis failed for session ${req.params.id}:`, err);
+    }
+
     res.status(204).send();
   } catch (err) {
     next(err);

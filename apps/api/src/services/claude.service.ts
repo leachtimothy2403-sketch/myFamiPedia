@@ -7,10 +7,6 @@
 // transcription.service.ts (no SDK dependency needed for one endpoint).
 import { env } from "../config/env";
 
-export async function generateProfileSummary(_personId: string): Promise<{ summary: string }> {
-  throw new Error("Not implemented");
-}
-
 export interface PriorQA {
   question: string;
   answer: string;
@@ -49,17 +45,45 @@ function isInterviewCategory(value: string): value is InterviewCategory {
   return (INTERVIEW_CATEGORIES as readonly string[]).includes(value);
 }
 
+// 2026-07-19 fix — category balance over the WHOLE interview, not just a
+// short recent window. The persona eval's first 90-question run (see
+// docs/handover_2026-07-19-qa-persona-eval.md's "second-order fix" section)
+// scored well overall (91/100) but its grading pass flagged real pacing
+// problems the existing "3-in-a-row" streak rule structurally can't catch:
+// community_faith and passions were each picked 4 of the 45 follow-up slots,
+// turning_points also 4, while parenthood/partnership/childhood only got 1
+// follow-up each — never 3-in-a-row at any point, so the streak rule never
+// fired, but badly unbalanced over the interview as a whole (Q40 and Q69
+// were both community_faith asking essentially the same "where did you
+// belong" question 29 turns apart; Q41/51/62/87 all mined "things you do for
+// yourself" repeatedly).
+//
+// 2026-07-19 fourth fix, same day — this used to tally straight from
+// priorQuestionTexts (every question ever asked, appended forever — see the
+// removed docstring below on generateFollowUpQuestion for why that got
+// replaced with biographySections). Only ever used each entry's lifePhase,
+// never its text, so the replacement is just as accurate a tally and a lot
+// cheaper to carry around: biographySections already has one row per
+// category with its own running count, no scanning needed.
+function tallyCategoryCounts(biographySections: { lifePhase: string; askedQuestionStems: string[] }[]): Map<InterviewCategory, number> {
+  const counts = new Map<InterviewCategory, number>(INTERVIEW_CATEGORIES.map((c) => [c, 0]));
+  for (const s of biographySections) {
+    if (isInterviewCategory(s.lifePhase)) counts.set(s.lifePhase, s.askedQuestionStems.length);
+  }
+  return counts;
+}
+
 // Deterministic, model-independent fallback for when Claude's response
 // doesn't parse into one of the eighteen known categories — picks whichever
-// known category appears least often in the recent history, so a malformed
-// response still nudges toward the same "spread across categories" goal
-// rather than defaulting to some arbitrary fixed category every time.
-function leastRecentlyUsedCategory(recentCategories: string[]): InterviewCategory {
-  const counts = new Map<InterviewCategory, number>(INTERVIEW_CATEGORIES.map((c) => [c, 0]));
-  for (const c of recentCategories) {
-    if (isInterviewCategory(c)) counts.set(c, (counts.get(c) ?? 0) + 1);
-  }
-  return [...counts.entries()].sort((a, b) => a[1] - b[1])[0][0];
+// known category has been used least often across the WHOLE interview (see
+// tallyCategoryCounts above), so a malformed response still nudges toward
+// the same "spread across categories" goal rather than defaulting to some
+// arbitrary fixed category every time. Deliberately based on the full-history
+// tally rather than just the recent-window streak (recentCategories) — a
+// category can be underused overall without ever appearing in the last few
+// questions, and the fallback should reach for that gap first.
+function leastUsedCategory(categoryCounts: Map<InterviewCategory, number>): InterviewCategory {
+  return [...categoryCounts.entries()].sort((a, b) => a[1] - b[1])[0][0];
 }
 
 export interface GeneratedFollowUp {
@@ -81,9 +105,39 @@ function sleep(ms: number) {
 // Kept local to this file rather than shared with the eval script's own
 // retry logic (scripts/personaQaEval/run.ts) — same idea, but that script
 // is intentionally a standalone, dependency-light tool with its own copy.
-async function callAnthropic(prompt: string, maxTokens: number): Promise<string> {
-  const maxAttempts = 3;
+//
+// 2026-07-19 second fix, same day — the plain retry above wasn't enough. A
+// deep real interview (question 50, by which point priorQuestionTexts and
+// the duplicate/category-avoidance instructions have grown substantially)
+// hit the same "no text content" failure with stop_reason: max_tokens —
+// meaning the model got cut off before ever emitting a text block, not a
+// random glitch. Retrying with the SAME token budget three times just hit
+// the identical wall three times, wasting all the retry attempts on a
+// failure that was never going to resolve itself. Now: when a failure is
+// specifically a max_tokens cutoff with no text produced, the next attempt
+// doubles the budget (capped at 2000) instead of just waiting and repeating
+// verbatim — genuinely transient failures (5xx, an empty response for no
+// discernible reason) still just get a plain backoff-and-retry.
+//
+// 2026-07-19 third fix, same day — a live 90-question persona eval run
+// (docs/handover_2026-07-19-qa-persona-eval.md, prompted by the category-
+// pacing fix in generateFollowUpQuestion just below) hit this same wall
+// again at question 65, but this time the escalation ladder itself wasn't
+// enough: 500 -> 1000 -> 2000 all cut off with zero text emitted, exhausting
+// every attempt at maxAttempts=3. By that point in a long interview the
+// category-balance instructions have real teeth (most categories already at
+// or past the "3 is a soft ceiling" line), which appears to make the
+// category choice a harder judgment call for the model and, on at least
+// this one run, pushed it past 2000 tokens before it ever produced a
+// complete text block. Raising the cap to 4000 and adding a fourth attempt
+// gives the escalation ladder (500 -> 1000 -> 2000 -> 4000) one more
+// doubling step to actually reach the budget that's needed, instead of
+// giving up right at the point the previous ceiling was already proven
+// insufficient.
+async function callAnthropic(prompt: string, initialMaxTokens: number): Promise<string> {
+  const maxAttempts = 4;
   let lastError: Error | undefined;
+  let maxTokens = initialMaxTokens;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -106,12 +160,21 @@ async function callAnthropic(prompt: string, maxTokens: number): Promise<string>
       const data = (await res.json()) as { content: { type: string; text?: string }[]; stop_reason?: string };
       const text = data.content?.find((block) => block.type === "text")?.text?.trim();
       if (!text) {
-        throw new Error(`Claude returned no text content (stop_reason: ${data.stop_reason ?? "unknown"})`);
+        const hitMaxTokens = data.stop_reason === "max_tokens";
+        throw new Error(
+          `Claude returned no text content (stop_reason: ${data.stop_reason ?? "unknown"})` +
+            (hitMaxTokens ? ` — cut off before any text was emitted at max_tokens=${maxTokens}` : "")
+        );
       }
       return text;
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
-      if (attempt < maxAttempts) await sleep(attempt * 500);
+      if (attempt < maxAttempts) {
+        if (lastError.message.includes("cut off before any text was emitted")) {
+          maxTokens = Math.min(maxTokens * 2, 4000);
+        }
+        await sleep(attempt * 500);
+      }
     }
   }
   throw lastError ?? new Error("Claude request failed for an unknown reason");
@@ -149,10 +212,6 @@ async function callAnthropic(prompt: string, maxTokens: number): Promise<string>
 // asked" instruction only had 8 questions' worth of memory — anything asked
 // earlier scrolled out of view entirely, including from the curated bank
 // itself, and the model had no way to know it was retreading old ground.
-// `priorQuestionTexts` fixes this cheaply: the full list of every question
-// ever asked this person, text + life phase only, no answers — cheap enough
-// to include in full even on a long interview, and enough on its own to
-// reliably avoid duplicates even without the detailed answer context.
 //
 // 2026-07-19 fix — category spread. Fixing repeats didn't fix a related but
 // distinct complaint: a run could still spend many follow-ups in a row
@@ -164,10 +223,41 @@ async function callAnthropic(prompt: string, maxTokens: number): Promise<string>
 // the question text (GeneratedFollowUp, not a bare string), given the recent
 // category sequence, with an explicit "don't stay in one category for 3+
 // questions in a row" rule — Tim's direction after reviewing eval output.
+//
+// 2026-07-19 second-order fix — the streak rule above only prevents 3
+// *consecutive* questions in one category; it does nothing to stop a
+// category from being revisited over and over with gaps in between. A full
+// 90-question persona eval run (docs/handover_2026-07-19-qa-persona-eval.md)
+// scored 91/100 but its own grading pass caught exactly this: community_faith
+// and passions each got 4 of the 45 follow-up slots (Q40/Q69 both asked
+// "where did you belong" 29 questions apart; Q41/51/62/87 all mined "things
+// you do for yourself"), while parenthood/partnership/childhood only got 1
+// each. Added a full-interview category tally and an explicit instruction to
+// prefer the least-used categories, treating 3 as a soft ceiling, plus a
+// rule against reusing the same illustrative anecdote as the centerpiece of
+// two different questions (the same eval run's Q9/Q63 both centered on the
+// one "never left a room without turning off the light" story).
+//
+// 2026-07-19 fourth fix, same day — the "full list of every question ever
+// asked" (priorQuestionTexts) that both the duplicate-check and the category
+// tally used to read from grew without any ceiling: every question, forever,
+// appended to every single follow-up prompt. Tim asked what a real follow-up
+// call actually cost by question 90 (~1.4 cents and climbing every question
+// after) and whether a running summary would help. It does, and the tally
+// above never actually needed the raw list in the first place — it only
+// ever read each entry's lifePhase. `biographySections` (built and
+// continuously merged in place by updateBiographySectionSummary, one row per
+// category, see biography.service.ts) replaces priorQuestionTexts here:
+// each category's already-asked question stems are scoped to that one
+// category (so still precise for duplicate-detection) and its running
+// summary tells the model what's already covered without ever needing the
+// full raw history. Bounded by how much there actually is to say about each
+// of the eighteen categories, not by how many questions have been asked —
+// flat instead of growing forever.
 export async function generateFollowUpQuestion(input: {
   personName: string;
   priorQAs: PriorQA[];
-  priorQuestionTexts: { question: string; lifePhase?: string }[];
+  biographySections: { lifePhase: string; summary: string; askedQuestionStems: string[] }[];
   recentCategories: string[]; // chronological, oldest first, most recent last
 }): Promise<GeneratedFollowUp> {
   if (!env.anthropicApiKey) {
@@ -180,40 +270,54 @@ export async function generateFollowUpQuestion(input: {
     .map((qa) => `Q (${qa.lifePhase ?? "general"}): ${qa.question}\nA: ${qa.answer}`)
     .join("\n\n");
 
-  const askedList = input.priorQuestionTexts
-    .map((q, i) => `${i + 1}. (${q.lifePhase ?? "general"}) ${q.question}`)
-    .join("\n");
+  const coverageText = input.biographySections
+    .filter((s) => s.summary.trim().length > 0)
+    .map((s) => `${s.lifePhase} (${s.askedQuestionStems.length} asked): ${s.summary}\n  Already asked in this category: ${s.askedQuestionStems.join(" | ")}`)
+    .join("\n\n");
 
   const categoryList = INTERVIEW_CATEGORIES.join(", ");
   const recentCategoriesText = input.recentCategories.length ? input.recentCategories.join(" -> ") : "(none yet)";
+
+  const categoryCounts = tallyCategoryCounts(input.biographySections);
+  const categoryCountsText = [...categoryCounts.entries()]
+    .sort((a, b) => a[1] - b[1])
+    .map(([c, n]) => `${c}: ${n}`)
+    .join(", ");
 
   const prompt = `You are helping build a family history archive through a structured life-story interview. Below is ${input.personName}'s interview so far — general life questions spanning categories like childhood, education, work, relationships, family, values, and legacy, with the life phase noted alongside each one, and their answers.
 
 ${context}
 
-Every question asked so far in this interview, in order (for reference only — some are from earlier in the conversation than the detailed answers above, which only show the most recent ones):
+What's already been covered in this interview so far, by category — a running summary, not a full transcript, so treat it as a reliable account of what's already known even though it isn't verbatim (categories not listed below haven't been touched yet):
 
-${askedList}
+${coverageText || "(nothing covered yet)"}
 
 The eighteen life-story categories this interview draws from: ${categoryList}.
 
 The categories of the most recent questions, in order (oldest to newest): ${recentCategoriesText}.
 
-The curated set of general life questions has been fully answered. Write ONE follow-up question that stays in that same register — a general life question, not a drill into one narrow specific memory, anecdote, or detail — that helps build a fuller, more complete picture of their overall life story. Prefer extending into a life area that's thin or unexplored so far, or a natural next general question suggested by what they've shared, over zooming into one specific event they mentioned. Check your draft question against the FULL list of questions already asked above, not just the detailed answers — do not ask anything substantively the same as a question already on that list, even if worded differently or framed from a new angle.
+How many questions have been asked in each category across the WHOLE interview so far, least to most: ${categoryCountsText}.
 
-Also spread across categories deliberately: don't stay in one category too long. If the same category appears for three or more of the most recent questions in a row, you MUST pick a different one this time, even if that category still has more to explore — there will be other chances to come back to it later.
+The curated set of general life questions has been fully answered. Write ONE follow-up question that stays in that same register — a general life question, not a drill into one narrow specific memory, anecdote, or detail — that helps build a fuller, more complete picture of their overall life story. Prefer extending into a life area that's thin or unexplored so far, or a natural next general question suggested by what they've shared, over zooming into one specific event they mentioned. Check your draft question against the coverage summary above, especially the "already asked in this category" lists — do not ask anything substantively the same as a question already on one of those lists, even if worded differently or framed from a new angle. Also do not build your new question around a specific anecdote, phrase, or story detail that the summary shows already served as the centerpiece of an earlier answer — ask about a different part of their life instead, even if it's the same general category.
+
+Also spread across categories deliberately: don't stay in one category too long. If the same category appears for three or more of the most recent questions in a row, you MUST pick a different one this time, even if that category still has more to explore — there will be other chances to come back to it later. Beyond that streak rule, strongly prefer a category near the low end of the whole-interview count above — treat 3 as a soft ceiling for any one category across the entire interview: do not pick a category that already has 3 or more questions unless every category with fewer already has 3 or more too, or this specific category has a clearly distinct, specific facet that nothing asked so far has touched.
 
 Keep it conversational, one sentence, second person ("you"/"your"). Respond in EXACTLY this two-line format, nothing else, no preamble:
 CATEGORY: <one of the eighteen category keys above, exactly as written, lowercase with underscores>
 QUESTION: <the question text — no quotation marks, no numbering>`;
 
-  const text = await callAnthropic(prompt, 250);
+  // 500 rather than 250 (this call's original budget) — a real interview
+  // hit max_tokens on the old value once the duplicate/category-avoidance
+  // instructions had grown large by question 50. The escalating retry above
+  // is the real safety net, but starting higher means it's less likely to be
+  // needed at all in the common case.
+  const text = await callAnthropic(prompt, 500);
 
   const categoryMatch = text.match(/CATEGORY:\s*(\S+)/i);
   const questionMatch = text.match(/QUESTION:\s*(.+)/is);
 
   const rawCategory = categoryMatch?.[1]?.trim().toLowerCase();
-  const lifePhase = rawCategory && isInterviewCategory(rawCategory) ? rawCategory : leastRecentlyUsedCategory(input.recentCategories);
+  const lifePhase = rawCategory && isInterviewCategory(rawCategory) ? rawCategory : leastUsedCategory(categoryCounts);
 
   // Falls back to the whole response as the question text if the two-line
   // format didn't parse at all — better than throwing away an otherwise
@@ -221,6 +325,78 @@ QUESTION: <the question text — no quotation marks, no numbering>`;
   const question = (questionMatch?.[1]?.trim() ?? text).replace(/^["']|["']$/g, "");
 
   return { question, lifePhase };
+}
+
+// 2026-07-19 fourth fix, same day — the other half of the biographySections
+// change above. Called once per transcribed answer, from
+// biography.service.ts's recordAnswerInBiography (the DB-orchestrating
+// caller — this function itself stays pure, no DB access, same convention
+// as the rest of this file). Deliberately narrow: it only ever folds ONE new
+// Q&A into the existing summary for the ONE category that answer belongs
+// to, never rewrites anything else — so unlike the old raw-question-list
+// approach, the cost of keeping this up to date doesn't grow with how long
+// the interview has been running, only with how much there actually is to
+// say about that one category (and the prompt below explicitly asks the
+// model to tighten older material rather than let any one section grow
+// without bound).
+export async function updateBiographySectionSummary(input: {
+  personName: string;
+  lifePhase: string;
+  existingSummary: string;
+  question: string;
+  answer: string;
+}): Promise<string> {
+  if (!env.anthropicApiKey) {
+    throw new Error(
+      "updateBiographySectionSummary is not configured — set ANTHROPIC_API_KEY. See docs/section2_pipeline.md section 4."
+    );
+  }
+
+  const prompt = `You are maintaining a running biographical summary of ${input.personName}'s life, one life-story category at a time — this one is "${input.lifePhase}". It's later assembled together with the other categories into a "who they were" narrative for their family, so it should read like real biographical prose, not interview notes.
+
+Current summary of this category so far (may be empty if nothing's been covered yet):
+${input.existingSummary || "(nothing yet)"}
+
+A new question in this category was just answered:
+Q: ${input.question}
+A: ${input.answer}
+
+Write an UPDATED summary for this one category that folds the new answer in naturally alongside what's already known — integrate it, don't just tack a new sentence on the end. Keep specific names, dates, and concrete details (they're what make this feel like a real person, not a generic bio), but stay tight: no more than 5-6 sentences total for this whole category, even as more gets added over time — if it's getting long, tighten or drop less-important older material rather than letting it grow forever. Third person ("he"/"she"/"they"), warm biographical prose, no headers, no bullet points, no preamble — just the summary text itself.`;
+
+  return callAnthropic(prompt, 400);
+}
+
+// The "who they were" paragraph GET /persons/:id/summary (persons.routes.ts)
+// has been reading from persons.ai_summary since migration 003, with
+// nothing ever writing to it — the route's own comment called it "still a
+// stub." Assembled here from the same per-category summaries
+// updateBiographySectionSummary keeps current, never from the raw
+// transcript, so this stays cheap regardless of how long someone's been
+// answering questions. Doubles as the legacy document Tim asked about: if
+// the interview subject passes away, this is a real, readable "who they
+// were" biography for the family, not a pile of raw Q&A to dig through.
+export async function synthesizeBiography(input: {
+  personName: string;
+  sections: { lifePhase: string; summary: string }[];
+}): Promise<string> {
+  if (!env.anthropicApiKey) {
+    throw new Error("synthesizeBiography is not configured — set ANTHROPIC_API_KEY. See docs/section2_pipeline.md section 4.");
+  }
+
+  const nonEmpty = input.sections.filter((s) => s.summary.trim().length > 0);
+  if (nonEmpty.length === 0) {
+    throw new Error("synthesizeBiography needs at least one non-empty biography section to work from");
+  }
+
+  const sectionsText = nonEmpty.map((s) => `${s.lifePhase}: ${s.summary}`).join("\n\n");
+
+  const prompt = `Below are per-category running summaries of ${input.personName}'s life story, gathered through a family history interview.
+
+${sectionsText}
+
+Write a single flowing "who they were" biography, a few warm paragraphs, weaving these categories together into one coherent life story rather than listing them one by one — the way a family member might describe someone they loved, not a résumé. Keep concrete, specific details (names, dates, particular stories) rather than generic statements. Third person. No headers, no bullet points, no category labels, no preamble — just the biography itself.`;
+
+  return callAnthropic(prompt, 1200);
 }
 
 export interface PhotoClassificationResult {

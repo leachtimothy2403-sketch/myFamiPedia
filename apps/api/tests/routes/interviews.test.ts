@@ -4,12 +4,16 @@ import { mockQueues, getQueueMock } from "../helpers/queueMock";
 
 mockQueues();
 
-// generateFollowUpQuestion makes a real Anthropic API call in production —
-// mocked here the same way this suite avoids other real external calls
-// (mockQueues for BullMQ). interviews.routes.ts imports it directly with no
-// dependency-injection seam, so a module mock is the only option.
+// generateFollowUpQuestion and synthesizeBiography both make real Anthropic
+// API calls in production — mocked here the same way this suite avoids
+// other real external calls (mockQueues for BullMQ). interviews.routes.ts
+// imports both directly with no dependency-injection seam, so a module mock
+// is the only option (and this module mock replaces the whole module, so
+// every export claude.service.ts has that interviews.routes.ts uses must be
+// listed here, not just the one under direct test).
 vi.mock("../../src/services/claude.service", () => ({
   generateFollowUpQuestion: vi.fn(async () => ({ question: "A generated follow-up question?", lifePhase: "passions" })),
+  synthesizeBiography: vi.fn(async () => "Grandma grew up in a small town and loved her tutoring program."),
 }));
 
 describe("interviews", () => {
@@ -122,19 +126,46 @@ describe("interviews", () => {
       expect(generateFollowUpQuestion).not.toHaveBeenCalled();
     });
 
-    // The actual regression guard for the persona-eval finding: with more
+    // The original regression guard for the persona-eval finding: with more
     // than 8 answered questions, the detailed priorQAs context is capped at
-    // 8 on purpose (cost), but priorQuestionTexts — the duplicate-avoidance
-    // list — must still carry every one of them, or the model loses
-    // visibility into anything asked earlier and can re-ask something
-    // substantively the same (seen for real: marriage-lessons asked three
-    // times over a 40-question interview).
-    it("passes every previously asked question to generateFollowUpQuestion, not just the most recent 8", async () => {
+    // 8 on purpose (cost), but the duplicate-avoidance signal must still
+    // carry every one of them, or the model loses visibility into anything
+    // asked earlier and can re-ask something substantively the same (seen
+    // for real: marriage-lessons asked three times over a 40-question
+    // interview).
+    //
+    // 2026-07-19 fourth fix, same day — that duplicate-avoidance signal used
+    // to be priorQuestionTexts, a flat list of every question ever asked
+    // that grew without any ceiling (Tim's real-dollar-cost question about a
+    // late-interview follow-up call). It's now biographySections — one row
+    // per category (migration 026, biography.service.ts), each carrying its
+    // own already-asked question stems — so this test seeds that table
+    // directly (bypassing the real transcription pipeline the same way
+    // answerDirectly already bypasses real transcription; the write side is
+    // covered separately in biography.service.test.ts and
+    // transcription.worker.test.ts) and checks the route reads it in full.
+    it("passes the full per-category biography, not the raw question history, to generateFollowUpQuestion", async () => {
       const questions = await seedCuratedQuestions(10);
       const sessionId = await createSession();
       for (const q of questions) {
         await answerDirectly(sessionId, q.id, `Answer to ${q.text}`);
       }
+      await ctx.knex()("interview_biography_sections").insert([
+        {
+          person_id: user.personId,
+          life_phase: "childhood",
+          summary: "Answered ten curated childhood questions.",
+          asked_question_stems: questions.map((q: { text: string }) => q.text),
+          question_count: 10,
+        },
+        {
+          person_id: user.personId,
+          life_phase: "work",
+          summary: "Worked at a department store as a teenager.",
+          asked_question_stems: ["What was your first job?"],
+          question_count: 1,
+        },
+      ]);
 
       const res = await ctx
         .request()
@@ -146,10 +177,12 @@ describe("interviews", () => {
       expect(generateFollowUpQuestion).toHaveBeenCalledTimes(1);
       const callArg = (generateFollowUpQuestion as ReturnType<typeof vi.fn>).mock.calls[0][0] as {
         priorQAs: unknown[];
-        priorQuestionTexts: unknown[];
+        biographySections: { lifePhase: string; askedQuestionStems: string[] }[];
         recentCategories: unknown[];
       };
-      expect(callArg.priorQuestionTexts).toHaveLength(10);
+      expect(callArg.biographySections).toHaveLength(2);
+      const childhoodSection = callArg.biographySections.find((s) => s.lifePhase === "childhood");
+      expect(childhoodSection?.askedQuestionStems).toHaveLength(10);
       expect(callArg.priorQAs).toHaveLength(8);
       // recentCategories is a separate, smaller window (6) used only for the
       // "don't camp on one category" rule, not duplicate-avoidance.
@@ -279,6 +312,14 @@ describe("interviews", () => {
   });
 
   describe("complete", () => {
+    // Same reason as the "GET /interview-questions/next" describe block
+    // above: generateFollowUpQuestion and synthesizeBiography are
+    // module-level vi.fn() mocks (vi.mock hoists and its factory runs once
+    // per file), so call counts accumulate across tests unless cleared.
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
+
     it("marks the session completed and enqueues one transcription job per answer", async () => {
       const startRes = await ctx.request().post("/api/v1/interview-sessions").set("Authorization", `Bearer ${user.accessToken}`).send({});
       const question = await ctx.knex()("interview_questions").insert({ text: "Q", life_phase: "childhood", sort_order: 1 }).returning("*").then((r) => r[0]);
@@ -315,6 +356,51 @@ describe("interviews", () => {
         .post(`/api/v1/interview-sessions/${startRes.body.id}/complete`)
         .set("Authorization", `Bearer ${user.accessToken}`);
       expect(res.status).toBe(409);
+    });
+
+    // 2026-07-19 fourth fix — persons.ai_summary (GET /persons/:id/summary)
+    // was a stub nothing ever wrote to. Completing a session is the trigger
+    // point: refresh the "who they were" legacy summary from whatever
+    // biography sections exist so far, cheaply, since it's built from the
+    // already-compact sections rather than the raw transcript.
+    it("regenerates persons.ai_summary from the current biography sections when a session completes", async () => {
+      await ctx.knex()("interview_biography_sections").insert([
+        { person_id: user.personId, life_phase: "childhood", summary: "Grew up two streets from the rail yard.", asked_question_stems: ["Q1"], question_count: 1 },
+        { person_id: user.personId, life_phase: "work", summary: "Worked at a department store.", asked_question_stems: ["Q2"], question_count: 1 },
+      ]);
+      const startRes = await ctx.request().post("/api/v1/interview-sessions").set("Authorization", `Bearer ${user.accessToken}`).send({});
+
+      const res = await ctx
+        .request()
+        .post(`/api/v1/interview-sessions/${startRes.body.id}/complete`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(204);
+
+      const { synthesizeBiography } = await import("../../src/services/claude.service");
+      expect(synthesizeBiography).toHaveBeenCalledTimes(1);
+      const callArg = (synthesizeBiography as ReturnType<typeof vi.fn>).mock.calls[0][0] as {
+        sections: { lifePhase: string; summary: string }[];
+      };
+      expect(callArg.sections).toHaveLength(2);
+
+      const person = await ctx.knex()("persons").where({ id: user.personId }).first();
+      expect(person.ai_summary).toBe("Grandma grew up in a small town and loved her tutoring program.");
+    });
+
+    it("leaves persons.ai_summary untouched when there are no biography sections yet", async () => {
+      const startRes = await ctx.request().post("/api/v1/interview-sessions").set("Authorization", `Bearer ${user.accessToken}`).send({});
+
+      const res = await ctx
+        .request()
+        .post(`/api/v1/interview-sessions/${startRes.body.id}/complete`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(204);
+
+      const { synthesizeBiography } = await import("../../src/services/claude.service");
+      expect(synthesizeBiography).not.toHaveBeenCalled();
+
+      const person = await ctx.knex()("persons").where({ id: user.personId }).first();
+      expect(person.ai_summary).toBeNull();
     });
   });
 

@@ -1,20 +1,37 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-// Pure unit tests — no DB needed. config/env.ts's other vars all have safe
-// defaults (see its docstring), and dotenv.config() never overwrites an
-// already-set process.env var, so setting/unsetting ANTHROPIC_API_KEY here
-// before each dynamic import is enough to exercise both branches cleanly.
-describe("claude.service — generateFollowUpQuestion", () => {
-  const originalKey = process.env.ANTHROPIC_API_KEY;
+// 2026-07-19 fifth fix, same day — the "not configured" tests below used to
+// delete process.env.ANTHROPIC_API_KEY and rely on vi.resetModules() forcing
+// a fresh re-import of config/env.ts to pick that up. That silently breaks
+// whenever a real ANTHROPIC_API_KEY is set in the repo root .env (Tim's own
+// local setup, and probably any real dev environment): env.ts's
+// dotenv.config() only skips a var that's already set, so once the test
+// deletes it, the fresh re-import's dotenv.config() call happily reloads the
+// real key from .env right back into process.env — the delete never
+// actually sticks. This was already one of the pre-existing failures flagged
+// in docs/handover_2026-07-19-qa-persona-eval.md before this session even
+// started; adding two more tests with the same pattern (below, for the new
+// biography functions) rather than fixing it would've just made three.
+// Mocking config/env.ts directly sidesteps the .env file entirely, giving
+// every test in this file a mocked { anthropicApiKey: "test-key" } object
+// regardless of what's actually in .env. The one test per describe block
+// that wants "not configured" mutates that object's property directly
+// before importing claude.service.ts; each describe block's afterEach
+// resets it back to "test-key" unconditionally afterward (not relying on
+// vi.resetModules() to hand back a fresh object — safer either way, and
+// cheap since it's a no-op for every test that never touched it).
+vi.mock("../../src/config/env", () => ({ env: { anthropicApiKey: "test-key" } }));
 
+// Pure unit tests — no DB needed.
+describe("claude.service — generateFollowUpQuestion", () => {
   beforeEach(() => {
     vi.resetModules();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.unstubAllGlobals();
-    if (originalKey === undefined) delete process.env.ANTHROPIC_API_KEY;
-    else process.env.ANTHROPIC_API_KEY = originalKey;
+    const { env } = await import("../../src/config/env");
+    env.anthropicApiKey = "test-key";
   });
 
   function mockClaudeResponse(text: string) {
@@ -25,10 +42,11 @@ describe("claude.service — generateFollowUpQuestion", () => {
   }
 
   it("throws a clear, catchable error when ANTHROPIC_API_KEY is not configured", async () => {
-    delete process.env.ANTHROPIC_API_KEY;
+    const { env } = await import("../../src/config/env");
+    env.anthropicApiKey = "";
     const { generateFollowUpQuestion } = await import("../../src/services/claude.service");
     await expect(
-      generateFollowUpQuestion({ personName: "Peggy", priorQAs: [], priorQuestionTexts: [], recentCategories: [] })
+      generateFollowUpQuestion({ personName: "Peggy", priorQAs: [], biographySections: [], recentCategories: [] })
     ).rejects.toThrow(/ANTHROPIC_API_KEY/);
   });
 
@@ -38,12 +56,16 @@ describe("claude.service — generateFollowUpQuestion", () => {
   // only ever had visibility into whichever answers were in priorQAs, which
   // interviews.routes.ts caps at the most recent 8 for cost reasons — so
   // anything asked earlier than that (including from the curated bank
-  // itself) was invisible to the model. priorQuestionTexts is the fix: the
-  // full history of question text (no answers, so it stays cheap), passed
-  // in full regardless of interview length. This test is the regression
-  // guard — it fails if a future change goes back to only using priorQAs
-  // for de-duplication.
-  it("includes every previously asked question in the prompt, not just the ones with detailed recent answers", async () => {
+  // itself) was invisible to the model.
+  //
+  // 2026-07-19 fourth fix, same day — originally fixed with priorQuestionTexts,
+  // a flat, ever-growing list of every question ever asked. That grew without
+  // any ceiling (Tim's real-dollar-cost question about a late-interview
+  // follow-up call), so it's been replaced with biographySections: one row
+  // per category, each carrying its own already-asked question stems. This
+  // test now checks the same underlying guarantee — nothing asked earlier
+  // than the priorQAs window goes invisible — against the new shape.
+  it("includes every previously asked question's stem in the prompt via its category's biography section", async () => {
     process.env.ANTHROPIC_API_KEY = "test-key";
     let capturedPrompt = "";
     vi.stubGlobal(
@@ -61,25 +83,23 @@ describe("claude.service — generateFollowUpQuestion", () => {
 
     const { generateFollowUpQuestion } = await import("../../src/services/claude.service");
 
-    // 10 questions asked in total, but only the 3 most recent carry detailed
-    // answer-level context — mirrors interviews.routes.ts's real shape once
-    // an interview runs past its priorAnswers cap.
-    const allTexts = Array.from({ length: 10 }, (_, i) => ({
-      question: `Question number ${i + 1}, spelled out so it can't collide with anything else?`,
-      lifePhase: "childhood",
-    }));
-    const recentQAs = allTexts.slice(-3).map((q) => ({ question: q.question, answer: `Answer to: ${q.question}`, lifePhase: q.lifePhase }));
+    // 10 questions asked in total, all one category — mirrors
+    // interviews.routes.ts's real shape once an interview runs past its
+    // priorAnswers cap: only the 3 most recent carry detailed answer-level
+    // context, but every stem still needs to reach the prompt.
+    const allTexts = Array.from({ length: 10 }, (_, i) => `Question number ${i + 1}, spelled out so it can't collide with anything else?`);
+    const recentQAs = allTexts.slice(-3).map((q) => ({ question: q, answer: `Answer to: ${q}`, lifePhase: "childhood" }));
 
     const result = await generateFollowUpQuestion({
       personName: "Peggy",
       priorQAs: recentQAs,
-      priorQuestionTexts: allTexts,
+      biographySections: [{ lifePhase: "childhood", summary: "Grew up two streets from the rail yard.", askedQuestionStems: allTexts }],
       recentCategories: [],
     });
 
     expect(result).toEqual({ question: "What is a place that always feels like home to you?", lifePhase: "passions" });
     for (const q of allTexts) {
-      expect(capturedPrompt).toContain(q.question);
+      expect(capturedPrompt).toContain(q);
     }
     expect(capturedPrompt.toLowerCase()).toContain("do not ask anything substantively the same");
   });
@@ -107,7 +127,7 @@ describe("claude.service — generateFollowUpQuestion", () => {
     const result = await generateFollowUpQuestion({
       personName: "Peggy",
       priorQAs: [],
-      priorQuestionTexts: [],
+      biographySections: [],
       recentCategories: ["partnership", "partnership", "partnership"],
     });
 
@@ -121,7 +141,17 @@ describe("claude.service — generateFollowUpQuestion", () => {
   // deterministically instead of silently storing garbage in life_phase —
   // and the fallback should still serve the "spread across categories"
   // goal, not just default to some fixed category every time.
-  it("falls back to the least-recently-used known category when the response doesn't name a valid one", async () => {
+  //
+  // 2026-07-19 second-order fix — this fallback now tallies from the
+  // WHOLE interview rather than just the recent streak window, so the test
+  // setup below reflects that: a "childhood" biography section with two
+  // asked stems actually on the record, not just present in the short
+  // recentCategories window.
+  //
+  // 2026-07-19 fourth fix, same day — the tally source is now
+  // biographySections (each section's own askedQuestionStems count) rather
+  // than a flat priorQuestionTexts list; same guarantee, cheaper shape.
+  it("falls back to the least-used-overall known category when the response doesn't name a valid one", async () => {
     process.env.ANTHROPIC_API_KEY = "test-key";
     vi.stubGlobal(
       "fetch",
@@ -135,7 +165,13 @@ describe("claude.service — generateFollowUpQuestion", () => {
     const result = await generateFollowUpQuestion({
       personName: "Peggy",
       priorQAs: [],
-      priorQuestionTexts: [],
+      biographySections: [
+        {
+          lifePhase: "childhood",
+          summary: "Grew up two streets from the rail yard.",
+          askedQuestionStems: ["What was your street like?", "What was your earliest memory?"],
+        },
+      ],
       recentCategories: ["childhood", "childhood"],
     });
 
@@ -145,11 +181,62 @@ describe("claude.service — generateFollowUpQuestion", () => {
     expect(result.lifePhase).not.toBe("childhood");
   });
 
+  // 2026-07-19 second-order fix — regression guard for the actual pacing bug
+  // the persona eval's grading pass caught: a category can be revisited
+  // over and over with gaps in between (never 3-in-a-row, so the streak rule
+  // never fires) and still end up badly over-used relative to others. This
+  // checks the whole-interview tally and the new soft-ceiling/anecdote-reuse
+  // instructions actually reach the prompt.
+  it("includes the whole-interview category tally and the soft-ceiling / anecdote-reuse instructions in the prompt", async () => {
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    let capturedPrompt = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: { body: string }) => {
+        capturedPrompt = JSON.parse(init.body).messages[0].content as string;
+        return {
+          ok: true,
+          json: async () => ({ content: [{ type: "text", text: "CATEGORY: parenthood\nQUESTION: What's a small parenting moment you still think about?" }] }),
+        };
+      })
+    );
+    const { generateFollowUpQuestion } = await import("../../src/services/claude.service");
+
+    // Mirrors the real eval run's imbalance: passions asked 4 times,
+    // parenthood never asked at all yet (no section for it at all — a
+    // category with zero questions simply has no row).
+    const biographySections = [
+      {
+        lifePhase: "passions",
+        summary: "Loves 1000-piece jigsaw puzzles and still hums old jazz standards doing dishes.",
+        askedQuestionStems: Array.from({ length: 4 }, (_, i) => `Passions question ${i + 1}?`),
+      },
+      {
+        lifePhase: "community_faith",
+        summary: "Faith has been a quiet thread through hard times.",
+        askedQuestionStems: ["What role has faith played in your life?"],
+      },
+    ];
+
+    const result = await generateFollowUpQuestion({
+      personName: "Peggy",
+      priorQAs: [],
+      biographySections,
+      recentCategories: ["passions", "community_faith"],
+    });
+
+    expect(result.lifePhase).toBe("parenthood");
+    expect(capturedPrompt).toContain("passions: 4");
+    expect(capturedPrompt).toContain("parenthood: 0");
+    expect(capturedPrompt.toLowerCase()).toContain("soft ceiling");
+    expect(capturedPrompt.toLowerCase()).toContain("centerpiece of an earlier answer");
+  });
+
   it("strips surrounding quotes from the question text", async () => {
     process.env.ANTHROPIC_API_KEY = "test-key";
     mockClaudeResponse('CATEGORY: legacy\nQUESTION: "What did Sunday mornings look like in your house?"');
     const { generateFollowUpQuestion } = await import("../../src/services/claude.service");
-    const result = await generateFollowUpQuestion({ personName: "Peggy", priorQAs: [], priorQuestionTexts: [], recentCategories: [] });
+    const result = await generateFollowUpQuestion({ personName: "Peggy", priorQAs: [], biographySections: [], recentCategories: [] });
     expect(result).toEqual({ question: "What did Sunday mornings look like in your house?", lifePhase: "legacy" });
   });
 
@@ -159,9 +246,9 @@ describe("claude.service — generateFollowUpQuestion", () => {
     vi.stubGlobal("fetch", fetchMock);
     const { generateFollowUpQuestion } = await import("../../src/services/claude.service");
     await expect(
-      generateFollowUpQuestion({ personName: "Peggy", priorQAs: [], priorQuestionTexts: [], recentCategories: [] })
+      generateFollowUpQuestion({ personName: "Peggy", priorQAs: [], biographySections: [], recentCategories: [] })
     ).rejects.toThrow(/500/);
-    expect(fetchMock).toHaveBeenCalledTimes(3); // exhausted all retry attempts
+    expect(fetchMock).toHaveBeenCalledTimes(4); // exhausted all retry attempts
   });
 
   // 2026-07-19 fix — a real interview hit exactly this ("no follow-up
@@ -190,10 +277,235 @@ describe("claude.service — generateFollowUpQuestion", () => {
     const result = await generateFollowUpQuestion({
       personName: "Peggy",
       priorQAs: [],
-      priorQuestionTexts: [],
+      biographySections: [],
       recentCategories: [],
     });
     expect(result).toEqual({ question: "What does resilience mean to you?", lifePhase: "values" });
     expect(callCount).toBe(3);
+  });
+
+  // 2026-07-19 second fix, same day — a deep real interview (question 50)
+  // hit "no text content" with stop_reason: max_tokens, meaning the model
+  // was cut off before emitting any text at the fixed 500-token budget.
+  // Plain retry at the same budget is guaranteed to fail identically every
+  // time — this is the regression guard for the actual fix: a max_tokens
+  // cutoff with no text should escalate the budget on retry, not just wait
+  // and repeat the same request verbatim.
+  it("doubles the token budget on retry after a max_tokens cutoff with no text, and succeeds once there's room", async () => {
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    const seenMaxTokens: number[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: { body: string }) => {
+        const body = JSON.parse(init.body);
+        seenMaxTokens.push(body.max_tokens);
+        if (seenMaxTokens.length < 2) {
+          // Cut off before any text block — the real failure shape.
+          return { ok: true, json: async () => ({ content: [], stop_reason: "max_tokens" }) };
+        }
+        return {
+          ok: true,
+          json: async () => ({ content: [{ type: "text", text: "CATEGORY: legacy\nQUESTION: What matters most to you now?" }] }),
+        };
+      })
+    );
+    const { generateFollowUpQuestion } = await import("../../src/services/claude.service");
+    const result = await generateFollowUpQuestion({
+      personName: "Peggy",
+      priorQAs: [],
+      biographySections: [],
+      recentCategories: [],
+    });
+    expect(result).toEqual({ question: "What matters most to you now?", lifePhase: "legacy" });
+    expect(seenMaxTokens[0]).toBe(500); // generateFollowUpQuestion's current starting budget
+    expect(seenMaxTokens[1]).toBe(1000); // doubled after the max_tokens cutoff, not retried verbatim
+  });
+
+  // 2026-07-19 third fix, same day — a live 90-question eval run hit this
+  // exact shape for real at question 65: 500 -> 1000 -> 2000 all cut off
+  // with zero text, exhausting the old maxAttempts=3 ladder entirely and
+  // failing the whole interview request. Regression guard for the fix:
+  // the ladder now has a fourth rung (4000) to actually reach.
+  it("escalates through all three doublings (500 -> 1000 -> 2000 -> 4000) when the first three attempts all cut off with no text", async () => {
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    const seenMaxTokens: number[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: { body: string }) => {
+        const body = JSON.parse(init.body);
+        seenMaxTokens.push(body.max_tokens);
+        if (seenMaxTokens.length < 4) {
+          return { ok: true, json: async () => ({ content: [], stop_reason: "max_tokens" }) };
+        }
+        return {
+          ok: true,
+          json: async () => ({ content: [{ type: "text", text: "CATEGORY: legacy\nQUESTION: What matters most to you now?" }] }),
+        };
+      })
+    );
+    const { generateFollowUpQuestion } = await import("../../src/services/claude.service");
+    const result = await generateFollowUpQuestion({
+      personName: "Peggy",
+      priorQAs: [],
+      biographySections: [],
+      recentCategories: [],
+    });
+    expect(result).toEqual({ question: "What matters most to you now?", lifePhase: "legacy" });
+    expect(seenMaxTokens).toEqual([500, 1000, 2000, 4000]);
+  });
+
+  it("does NOT escalate the token budget for a plain empty response (no max_tokens cutoff)", async () => {
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    const seenMaxTokens: number[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: { body: string }) => {
+        const body = JSON.parse(init.body);
+        seenMaxTokens.push(body.max_tokens);
+        if (seenMaxTokens.length < 2) {
+          return { ok: true, json: async () => ({ content: [], stop_reason: "end_turn" }) };
+        }
+        return { ok: true, json: async () => ({ content: [{ type: "text", text: "CATEGORY: legacy\nQUESTION: Anything else?" }] }) };
+      })
+    );
+    const { generateFollowUpQuestion } = await import("../../src/services/claude.service");
+    await generateFollowUpQuestion({ personName: "Peggy", priorQAs: [], biographySections: [], recentCategories: [] });
+    expect(seenMaxTokens).toEqual([500, 500]); // unchanged — this wasn't a max_tokens cutoff
+  });
+});
+
+// 2026-07-19 fourth fix — the two new pure functions biography.service.ts
+// calls (recordAnswerInBiography, on the write side, and the
+// /interview-sessions/:id/complete handler, on the synthesis side). Both
+// stay pure here — no DB — same convention as generateFollowUpQuestion.
+describe("claude.service — updateBiographySectionSummary", () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    const { env } = await import("../../src/config/env");
+    env.anthropicApiKey = "test-key";
+  });
+
+  it("throws a clear, catchable error when ANTHROPIC_API_KEY is not configured", async () => {
+    const { env } = await import("../../src/config/env");
+    env.anthropicApiKey = "";
+    const { updateBiographySectionSummary } = await import("../../src/services/claude.service");
+    await expect(
+      updateBiographySectionSummary({ personName: "Peggy", lifePhase: "childhood", existingSummary: "", question: "Q", answer: "A" })
+    ).rejects.toThrow(/ANTHROPIC_API_KEY/);
+  });
+
+  it("sends the existing summary and the new Q&A, and returns the model's updated summary text", async () => {
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    let capturedPrompt = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: { body: string }) => {
+        capturedPrompt = JSON.parse(init.body).messages[0].content as string;
+        return {
+          ok: true,
+          json: async () => ({
+            content: [{ type: "text", text: "She grew up two streets from the rail yard and rescued a stray cat named Rusty at nine." }],
+          }),
+        };
+      })
+    );
+    const { updateBiographySectionSummary } = await import("../../src/services/claude.service");
+
+    const result = await updateBiographySectionSummary({
+      personName: "Peggy",
+      lifePhase: "childhood",
+      existingSummary: "She grew up two streets from the rail yard.",
+      question: "Did you ever have a pet growing up?",
+      answer: "Yes, a stray orange tabby I rescued and named Rusty when I was nine.",
+    });
+
+    expect(result).toBe("She grew up two streets from the rail yard and rescued a stray cat named Rusty at nine.");
+    expect(capturedPrompt).toContain("She grew up two streets from the rail yard.");
+    expect(capturedPrompt).toContain("Did you ever have a pet growing up?");
+    expect(capturedPrompt).toContain("a stray orange tabby I rescued and named Rusty");
+    // The self-compression instruction — this is what keeps a section's cost
+    // flat over a long interview instead of growing without bound.
+    expect(capturedPrompt.toLowerCase()).toContain("no more than 5-6 sentences");
+  });
+
+  it("tells the model there's nothing yet when existingSummary is empty, rather than an empty string", async () => {
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    let capturedPrompt = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: { body: string }) => {
+        capturedPrompt = JSON.parse(init.body).messages[0].content as string;
+        return { ok: true, json: async () => ({ content: [{ type: "text", text: "First summary." }] }) };
+      })
+    );
+    const { updateBiographySectionSummary } = await import("../../src/services/claude.service");
+    await updateBiographySectionSummary({ personName: "Peggy", lifePhase: "childhood", existingSummary: "", question: "Q", answer: "A" });
+    expect(capturedPrompt).toContain("(nothing yet)");
+  });
+});
+
+describe("claude.service — synthesizeBiography", () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    const { env } = await import("../../src/config/env");
+    env.anthropicApiKey = "test-key";
+  });
+
+  it("throws a clear, catchable error when ANTHROPIC_API_KEY is not configured", async () => {
+    const { env } = await import("../../src/config/env");
+    env.anthropicApiKey = "";
+    const { synthesizeBiography } = await import("../../src/services/claude.service");
+    await expect(
+      synthesizeBiography({ personName: "Peggy", sections: [{ lifePhase: "childhood", summary: "Grew up by the rail yard." }] })
+    ).rejects.toThrow(/ANTHROPIC_API_KEY/);
+  });
+
+  // Populating persons.ai_summary with an empty/junk string would be worse
+  // than leaving it null — GET /persons/:id/summary (persons.routes.ts)
+  // already has an honest "generated: false" path for that case.
+  it("throws rather than calling Claude when every section is empty", async () => {
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const { synthesizeBiography } = await import("../../src/services/claude.service");
+    await expect(
+      synthesizeBiography({ personName: "Peggy", sections: [{ lifePhase: "childhood", summary: "" }] })
+    ).rejects.toThrow(/at least one non-empty/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("assembles all non-empty sections into the prompt and returns the synthesized narrative", async () => {
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    let capturedPrompt = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: { body: string }) => {
+        capturedPrompt = JSON.parse(init.body).messages[0].content as string;
+        return { ok: true, json: async () => ({ content: [{ type: "text", text: "Peggy grew up in a small railroad town..." }] }) };
+      })
+    );
+    const { synthesizeBiography } = await import("../../src/services/claude.service");
+
+    const result = await synthesizeBiography({
+      personName: "Peggy",
+      sections: [
+        { lifePhase: "childhood", summary: "Grew up two streets from the rail yard." },
+        { lifePhase: "work", summary: "" }, // no answers in this category yet — should be skipped, not passed as empty
+        { lifePhase: "legacy", summary: "Hopes to be remembered as someone who listened." },
+      ],
+    });
+
+    expect(result).toBe("Peggy grew up in a small railroad town...");
+    expect(capturedPrompt).toContain("childhood: Grew up two streets from the rail yard.");
+    expect(capturedPrompt).toContain("legacy: Hopes to be remembered as someone who listened.");
+    expect(capturedPrompt).not.toContain("work:");
   });
 });
