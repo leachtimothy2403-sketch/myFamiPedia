@@ -4,8 +4,23 @@ import { withRlsContext } from "../db/pool";
 import { notificationQueue, embeddingQueue } from "../jobs/queue";
 import { HttpError } from "../utils/httpError";
 import { isValidDate } from "../utils/isValidDate";
+import { presignDownload } from "../services/r2.service";
 
 export const memoriesRouter = Router();
+
+// Same best-effort presign as photos.routes.ts / collection.routes.ts —
+// presignDownload throws hard when R2 isn't configured, which would take an
+// otherwise-fine read endpoint down with a 500 in any environment without R2
+// credentials set (e.g. the test suite).
+async function safePresignDownload(r2Key: string): Promise<string | null> {
+  try {
+    return await presignDownload(r2Key);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(`presignDownload failed for ${r2Key}:`, err);
+    return null;
+  }
+}
 
 // General memory creation — the living-person counterpart to
 // persons.routes.ts's POST /persons/:id/memories, which is deceased-profile
@@ -143,6 +158,78 @@ memoriesRouter.patch("/memories/:id", requireAuth, async (req: AuthedRequest, re
       await embeddingQueue.add("embed-memory", { memoryId: memory.id });
     }
     res.json(memory);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Companion to the accept-a-proposal gap noted above (2026-07-19): accepting
+// a cluster-sourced proposed_memories candidate attaches EVERY photo in the
+// cluster to the new memory unconditionally (photoClustering.worker.ts groups
+// purely on time/GPS, so a cluster can easily catch a few photos that don't
+// actually belong in the resulting memory — a stray shot mid-outing, a
+// near-duplicate burst). collection/compose.tsx previously only ever
+// fetched/displayed the ONE representative photo it was launched with, with
+// no way to see or trim the rest. This lists all of them so the client can
+// build that picker; DELETE below is the corresponding removal action.
+memoriesRouter.get("/memories/:id/photos", requireAuth, async (req: AuthedRequest, res, next) => {
+  try {
+    const { personId, familyGroupId } = req.auth!;
+    const items = await withRlsContext({ personId, familyGroupId }, async (trx) => {
+      const memory = await trx("memories").where({ id: req.params.id }).first();
+      if (!memory) throw new HttpError(404, "Memory not found");
+
+      const photos = await trx("memory_photos as mp")
+        .join("photos as p", "p.id", "mp.photo_id")
+        .where("mp.memory_id", memory.id)
+        .orderBy("p.taken_at", "asc")
+        .select("p.id", "p.r2_key", "p.face_count", "p.taken_at");
+
+      return Promise.all(
+        photos.map(async (p: { id: string; r2_key: string; face_count: number; taken_at: Date }) => ({
+          id: p.id,
+          photoUrl: await safePresignDownload(p.r2_key),
+          faceCount: p.face_count,
+          takenAt: p.taken_at,
+        }))
+      );
+    });
+    res.json({ items });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Removal side of the picker above. Same permission shape as PATCH
+// /memories/:id (contributor-only, posthumous contributions excluded — those
+// only ever move through moderation). Refuses to drop the last photo rather
+// than leaving a photo-provenance memory with nothing attached; the user can
+// still delete/retract the whole memory through the existing routes if that's
+// really what they want.
+memoriesRouter.delete("/memories/:id/photos/:photoId", requireAuth, async (req: AuthedRequest, res, next) => {
+  try {
+    const { personId, familyGroupId } = req.auth!;
+    await withRlsContext({ personId, familyGroupId }, async (trx) => {
+      const memory = await trx("memories").where({ id: req.params.id }).first();
+      if (!memory) throw new HttpError(404, "Memory not found");
+      if (memory.contributor_id !== personId) {
+        throw new HttpError(403, "This memory's photos cannot be edited by anyone other than its original contributor");
+      }
+      if (memory.is_posthumous_contribution) {
+        throw new HttpError(403, "Posthumous-profile contributions cannot be self-edited — they go through moderation instead");
+      }
+
+      const link = await trx("memory_photos").where({ memory_id: memory.id, photo_id: req.params.photoId }).first();
+      if (!link) throw new HttpError(404, "This photo is not attached to this memory");
+
+      const remainingCount = await trx("memory_photos").where({ memory_id: memory.id }).count().first();
+      if (Number(remainingCount?.count ?? 0) <= 1) {
+        throw new HttpError(400, "Can't remove the last photo from a memory — delete the memory instead if you don't want it");
+      }
+
+      await trx("memory_photos").where({ memory_id: memory.id, photo_id: req.params.photoId }).del();
+    });
+    res.status(204).send();
   } catch (err) {
     next(err);
   }

@@ -189,6 +189,148 @@ describe("memories", () => {
     });
   });
 
+  // 2026-07-19 — the picker behind "select which photos to keep in a memory
+  // from a cluster" (docs/media_pipeline.md). Accepting a cluster-sourced
+  // proposal attaches every one of its photos to the new memory
+  // unconditionally; these two endpoints are what let compose.tsx list them
+  // and trim the ones that don't belong.
+  describe("GET /memories/:id/photos", () => {
+    async function attachPhotos(memoryId: string, count: number) {
+      const photos = await ctx
+        .knex()("photos")
+        .insert(
+          Array.from({ length: count }, (_, i) => ({
+            family_group_id: user.familyGroupId,
+            r2_key: `p${i}.jpg`,
+            uploaded_by: user.personId,
+            taken_at: new Date(2026, 6, 10 + i),
+          }))
+        )
+        .returning("*");
+      await ctx
+        .knex()("memory_photos")
+        .insert(photos.map((p: { id: string }) => ({ memory_id: memoryId, photo_id: p.id })));
+      return photos;
+    }
+
+    it("lists a memory's attached photos ordered by taken_at", async () => {
+      const memory = await createMemory();
+      const photos = await attachPhotos(memory.id, 3);
+
+      const res = await ctx
+        .request()
+        .get(`/api/v1/memories/${memory.id}/photos`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(200);
+      expect(res.body.items).toHaveLength(3);
+      expect(res.body.items.map((i: { id: string }) => i.id)).toEqual(photos.map((p: { id: string }) => p.id));
+      // photoUrl is null in the test env (no R2 configured) — safePresignDownload's fallback.
+      expect(res.body.items[0]).toHaveProperty("photoUrl", null);
+      expect(res.body.items[0]).toHaveProperty("faceCount");
+    });
+
+    it("404s on a nonexistent memory", async () => {
+      const res = await ctx
+        .request()
+        .get(`/api/v1/memories/00000000-0000-0000-0000-000000000000/photos`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe("DELETE /memories/:id/photos/:photoId", () => {
+    async function attachPhotos(memoryId: string, count: number) {
+      const photos = await ctx
+        .knex()("photos")
+        .insert(
+          Array.from({ length: count }, (_, i) => ({
+            family_group_id: user.familyGroupId,
+            r2_key: `p${i}.jpg`,
+            uploaded_by: user.personId,
+          }))
+        )
+        .returning("*");
+      await ctx
+        .knex()("memory_photos")
+        .insert(photos.map((p: { id: string }) => ({ memory_id: memoryId, photo_id: p.id })));
+      return photos;
+    }
+
+    it("removes one photo from a memory that has several", async () => {
+      const memory = await createMemory();
+      const photos = await attachPhotos(memory.id, 3);
+
+      const res = await ctx
+        .request()
+        .delete(`/api/v1/memories/${memory.id}/photos/${photos[0].id}`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(204);
+
+      const remaining = await ctx.knex()("memory_photos").where({ memory_id: memory.id });
+      expect(remaining).toHaveLength(2);
+      expect(remaining.map((r: { photo_id: string }) => r.photo_id)).not.toContain(photos[0].id);
+    });
+
+    it("refuses to remove the last photo (400)", async () => {
+      const memory = await createMemory();
+      const photos = await attachPhotos(memory.id, 1);
+
+      const res = await ctx
+        .request()
+        .delete(`/api/v1/memories/${memory.id}/photos/${photos[0].id}`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(400);
+
+      const remaining = await ctx.knex()("memory_photos").where({ memory_id: memory.id });
+      expect(remaining).toHaveLength(1);
+    });
+
+    it("404s when the photo isn't attached to this memory", async () => {
+      const memory = await createMemory();
+      await attachPhotos(memory.id, 2);
+      const [strayPhoto] = await ctx
+        .knex()("photos")
+        .insert({ family_group_id: user.familyGroupId, r2_key: "stray.jpg", uploaded_by: user.personId })
+        .returning("*");
+
+      const res = await ctx
+        .request()
+        .delete(`/api/v1/memories/${memory.id}/photos/${strayPhoto.id}`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(404);
+    });
+
+    it("rejects removal from anyone other than the contributor (403)", async () => {
+      const memory = await createMemory();
+      const photos = await attachPhotos(memory.id, 2);
+
+      const res = await ctx
+        .request()
+        .delete(`/api/v1/memories/${memory.id}/photos/${photos[0].id}`)
+        .set("Authorization", `Bearer ${other.accessToken}`);
+      expect(res.status).toBe(403);
+    });
+
+    it("rejects removal on a posthumous contribution (403)", async () => {
+      const memory = await createMemory({ is_posthumous_contribution: true });
+      const photos = await attachPhotos(memory.id, 2);
+
+      const res = await ctx
+        .request()
+        .delete(`/api/v1/memories/${memory.id}/photos/${photos[0].id}`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(403);
+    });
+
+    it("404s on a nonexistent memory", async () => {
+      const res = await ctx
+        .request()
+        .delete(`/api/v1/memories/00000000-0000-0000-0000-000000000000/photos/00000000-0000-0000-0000-000000000000`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(404);
+    });
+  });
+
   it("reacts to a memory idempotently (onConflict ignore)", async () => {
     const memory = await createMemory();
     const res1 = await ctx
