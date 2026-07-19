@@ -40,11 +40,30 @@ const RELATION_OPTIONS: { label: string; value: RelationshipType }[] = [
 // since GET /photos/:id/faces has no way to reflect a pending proposal
 // (photo_persons has no row yet, and the proposal queue itself is
 // admin-only to read).
+//
+// 2026-07-19 — "select which photos to keep" (docs/media_pipeline.md): when
+// memoryId is set, this screen used to only ever show/tag the single
+// representative photo it launched with, even though a cluster-sourced
+// accept can attach many more (photoClustering.worker.ts groups purely on
+// time/GPS, so a stray or near-duplicate shot can ride along). It now fetches
+// the full list (GET /memories/:id/photos) and renders it as a thumbnail
+// strip once there's more than one; tapping a thumbnail makes it the active
+// photo for tap-to-tag (activePhotoId, distinct from the photoId param so
+// switching doesn't fight the URL), and the × removes it from the memory
+// (DELETE /memories/:id/photos/:photoId) — disabled implicitly once only one
+// photo is left, since the backend refuses to drop the last one anyway.
 interface FaceBox {
   id: string;
   faceCoordinates: { left: number; top: number; width: number; height: number };
   confidence: number | null;
   tag: { personId: string; name: string; identificationStatus: string } | null;
+}
+
+interface MemoryPhoto {
+  id: string;
+  photoUrl: string | null;
+  faceCount: number;
+  takenAt: string | null;
 }
 
 const SCREEN_WIDTH = Dimensions.get("window").width;
@@ -58,6 +77,14 @@ export default function ComposeMemoryScreen() {
   const isEditingExisting = Boolean(memoryId);
   const { personId, familyGroupId } = useSessionIds();
   const [mountedAt] = useState(() => Date.now());
+
+  // Which of the memory's photos is currently shown in the big tap-to-tag
+  // view. Defaults to whatever photoId this screen was launched with (the
+  // representative photo review.tsx's Accept picked) and can move to a
+  // sibling photo via the strip below — see "selecting from a cluster" note
+  // further down.
+  const [activePhotoId, setActivePhotoId] = useState(photoId);
+  useEffect(() => setActivePhotoId(photoId), [photoId]);
 
   const [imageSize, setImageSize] = useState<{ width: number; height: number } | null>(null);
   const [activeFaceId, setActiveFaceId] = useState<string | null>(null);
@@ -74,18 +101,59 @@ export default function ComposeMemoryScreen() {
   const [proposing, setProposing] = useState(false);
 
   const { data: photo } = useQuery({
-    queryKey: ["photo", photoId],
-    queryFn: () => apiClient.request<{ photoUrl: string }>(`/photos/${photoId}`),
-    enabled: Boolean(photoId),
+    queryKey: ["photo", activePhotoId],
+    queryFn: () => apiClient.request<{ photoUrl: string }>(`/photos/${activePhotoId}`),
+    enabled: Boolean(activePhotoId),
   });
+
+  // The picker this screen was missing: accepting a cluster-sourced proposal
+  // attaches every one of the cluster's photos to the memory unconditionally
+  // (photoClustering.worker.ts groups purely on time/GPS, so a stray shot or
+  // near-duplicate can easily ride along). Only fetched when memoryId is set
+  // — the plain pull-path/new-memory case (add-photo.tsx) is always exactly
+  // one photo and has no memory to query photos from yet anyway.
+  const {
+    data: memoryPhotosData,
+    refetch: refetchMemoryPhotos,
+  } = useQuery({
+    queryKey: ["memory-photos", memoryId],
+    queryFn: () => apiClient.request<{ items: MemoryPhoto[] }>(`/memories/${memoryId}/photos`),
+    enabled: Boolean(memoryId),
+  });
+  const memoryPhotos = memoryPhotosData?.items ?? [];
+  const [removingPhotoId, setRemovingPhotoId] = useState<string | null>(null);
+
+  function selectPhoto(id: string) {
+    if (id === activePhotoId) return;
+    setActivePhotoId(id);
+    closeFacePanel();
+  }
+
+  async function removePhoto(id: string) {
+    if (!memoryId || memoryPhotos.length <= 1) return;
+    setRemovingPhotoId(id);
+    setError(null);
+    try {
+      await apiClient.request(`/memories/${memoryId}/photos/${id}`, { method: "DELETE" });
+      if (activePhotoId === id) {
+        const next = memoryPhotos.find((p) => p.id !== id);
+        if (next) selectPhoto(next.id);
+      }
+      await refetchMemoryPhotos();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't remove that photo — try again.");
+    } finally {
+      setRemovingPhotoId(null);
+    }
+  }
 
   const {
     data: facesData,
     refetch: refetchFaces,
   } = useQuery({
-    queryKey: ["photo-faces", photoId],
-    queryFn: () => apiClient.request<{ faces: FaceBox[]; crowdMode: boolean }>(`/photos/${photoId}/faces`),
-    enabled: Boolean(photoId),
+    queryKey: ["photo-faces", activePhotoId],
+    queryFn: () => apiClient.request<{ faces: FaceBox[]; crowdMode: boolean }>(`/photos/${activePhotoId}/faces`),
+    enabled: Boolean(activePhotoId),
     // Face detection (faceDetection.worker.ts) runs async right after
     // upload — the user can reach this screen (add-photo.tsx navigates here
     // immediately once the upload completes) before the Rekognition
@@ -150,9 +218,9 @@ export default function ComposeMemoryScreen() {
   }
 
   async function tagFace(taggedPersonId: string) {
-    if (!activeFace || !photoId) return;
+    if (!activeFace || !activePhotoId) return;
     try {
-      await apiClient.request(`/photos/${photoId}/faces/${activeFace.id}/tag`, {
+      await apiClient.request(`/photos/${activePhotoId}/faces/${activeFace.id}/tag`, {
         method: "POST",
         // memoryId is only set when this screen was reached via review.tsx's
         // Accept button (an already-created memory) — passing it through
@@ -170,7 +238,7 @@ export default function ComposeMemoryScreen() {
   }
 
   async function proposeNewPerson() {
-    if (!activeFace || !photoId) return;
+    if (!activeFace || !activePhotoId) return;
     if (!newPersonName.trim()) {
       setError("Enter a name for this person.");
       return;
@@ -182,7 +250,7 @@ export default function ComposeMemoryScreen() {
     setProposing(true);
     setError(null);
     try {
-      await apiClient.request(`/photos/${photoId}/faces/${activeFace.id}/tag`, {
+      await apiClient.request(`/photos/${activePhotoId}/faces/${activeFace.id}/tag`, {
         method: "POST",
         body: {
           newPersonName: newPersonName.trim(),
@@ -227,7 +295,7 @@ export default function ComposeMemoryScreen() {
           eventDate: trimmedDate || null,
           provenanceType: "photo",
           isPrivate: false,
-          photoIds: [photoId as string],
+          photoIds: [activePhotoId as string],
           personIds: taggedPersonIds,
         });
       }
@@ -308,6 +376,74 @@ export default function ComposeMemoryScreen() {
           );
         })}
       </View>
+
+      {memoryPhotos.length > 1 ? (
+        <View style={{ gap: 6 }}>
+          <Text style={{ fontWeight: "600" }}>
+            {memoryPhotos.length} photos from this outing — tap to switch, remove any that don't belong
+          </Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+            <View style={{ flexDirection: "row", gap: 8 }}>
+              {memoryPhotos.map((p) => (
+                <View key={p.id} style={{ width: 84, height: 84 }}>
+                  <TouchableOpacity onPress={() => selectPhoto(p.id)} activeOpacity={0.8}>
+                    {p.photoUrl ? (
+                      <Image
+                        source={{ uri: p.photoUrl }}
+                        style={{
+                          width: 84,
+                          height: 84,
+                          borderRadius: 8,
+                          backgroundColor: "#e5e5e5",
+                          borderWidth: p.id === activePhotoId ? 3 : 0,
+                          borderColor: "#1a73e8",
+                        }}
+                        resizeMode="cover"
+                      />
+                    ) : (
+                      <View
+                        style={{
+                          width: 84,
+                          height: 84,
+                          borderRadius: 8,
+                          backgroundColor: "#e5e5e5",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          borderWidth: p.id === activePhotoId ? 3 : 0,
+                          borderColor: "#1a73e8",
+                        }}
+                      >
+                        <Text style={{ fontSize: 11, color: "#666" }}>No preview</Text>
+                      </View>
+                    )}
+                  </TouchableOpacity>
+                  {/* Only rendered inside the memoryPhotos.length > 1 branch above, so
+                      there's always at least one other photo left after removing this one —
+                      matches the backend's "can't drop the last photo" rule without a separate check. */}
+                  <TouchableOpacity
+                    onPress={() => removePhoto(p.id)}
+                    disabled={removingPhotoId === p.id}
+                    style={{
+                      position: "absolute",
+                      top: -6,
+                      right: -6,
+                      width: 22,
+                      height: 22,
+                      borderRadius: 11,
+                      backgroundColor: "#b3261e",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      opacity: removingPhotoId === p.id ? 0.5 : 1,
+                    }}
+                  >
+                    <Text style={{ color: "white", fontSize: 13, fontWeight: "700", lineHeight: 15 }}>×</Text>
+                  </TouchableOpacity>
+                </View>
+              ))}
+            </View>
+          </ScrollView>
+        </View>
+      ) : null}
 
       {faces.length === 0 ? (
         <View style={{ gap: 4 }}>
