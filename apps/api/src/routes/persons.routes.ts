@@ -4,6 +4,7 @@ import { withRlsContext } from "../db/pool";
 import { notImplemented } from "../utils/notImplemented";
 import { HttpError } from "../utils/httpError";
 import { embeddingQueue } from "../jobs/queue";
+import { isValidDate } from "../utils/isValidDate";
 
 export const personsRouter = Router();
 
@@ -113,6 +114,16 @@ personsRouter.patch("/persons/:id", requireAuth, async (req: AuthedRequest, res,
   try {
     const { personId, familyGroupId } = req.auth!;
     const { name, birthDate, deathDate, profileData } = req.body ?? {};
+    // Same bug class as POST /memories' eventDate (src/utils/isValidDate.ts):
+    // these went straight into a knex update with no format check, so a bad
+    // value would 500 with a leaked raw Postgres error instead of a clean
+    // 400. null is allowed (clearing the field); anything else must parse.
+    if (birthDate !== undefined && birthDate !== null && !isValidDate(birthDate)) {
+      return res.status(400).json({ error: "birthDate must be a valid YYYY-MM-DD date" });
+    }
+    if (deathDate !== undefined && deathDate !== null && !isValidDate(deathDate)) {
+      return res.status(400).json({ error: "deathDate must be a valid YYYY-MM-DD date" });
+    }
     const updates: Record<string, unknown> = {};
     if (name !== undefined) updates.name = name;
     if (birthDate !== undefined) updates.birth_date = birthDate;
@@ -297,6 +308,12 @@ personsRouter.post(
         return res
           .status(400)
           .json({ error: "name, deathDate, relationshipType, and relatedToPersonId are required" });
+      }
+      if (!isValidDate(deathDate)) {
+        return res.status(400).json({ error: "deathDate must be a valid YYYY-MM-DD date" });
+      }
+      if (birthDate !== undefined && birthDate !== null && !isValidDate(birthDate)) {
+        return res.status(400).json({ error: "birthDate must be a valid YYYY-MM-DD date" });
       }
 
       const result = await withRlsContext({ personId, familyGroupId }, async (trx) => {

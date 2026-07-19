@@ -62,6 +62,29 @@ describe("persons", () => {
     expect(res.body.birth_date).toContain("1990-01-01");
   });
 
+  // Same bug class as memories.test.ts's eventDate coverage: birthDate/
+  // deathDate went straight into a knex update with no format check, so a
+  // bad value would 500 with a leaked raw Postgres error instead of a clean
+  // 400 (src/utils/isValidDate.ts).
+  it("rejects a malformed birthDate on PATCH /persons/:id with a clean 400", async () => {
+    const res = await ctx
+      .request()
+      .patch(`/api/v1/persons/${user.personId}`)
+      .set("Authorization", `Bearer ${user.accessToken}`)
+      .send({ birthDate: "not-a-date" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/birthDate/i);
+  });
+
+  it("allows clearing birthDate/deathDate with null on PATCH /persons/:id", async () => {
+    const res = await ctx
+      .request()
+      .patch(`/api/v1/persons/${user.personId}`)
+      .set("Authorization", `Bearer ${user.accessToken}`)
+      .send({ birthDate: null });
+    expect(res.status).toBe(200);
+  });
+
   describe("GET /persons/:id/summary", () => {
     it("reports generated:false when no ai_summary exists yet", async () => {
       const res = await ctx
@@ -359,6 +382,16 @@ describe("persons", () => {
       expect(invitations).toHaveLength(0);
       const relationships = await ctx.knex()("relationships").where({ person_b_id: res.body.id });
       expect(relationships).toHaveLength(1);
+    });
+
+    it("rejects a malformed deathDate on POST /persons/deceased with a clean 400", async () => {
+      const res = await ctx
+        .request()
+        .post(`/api/v1/persons/deceased`)
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ name: "Grandpa Joe", deathDate: "June 2015", relationshipType: "parent_of", relatedToPersonId: user.personId });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/deathDate/i);
     });
 
     it("requires name, deathDate, relationshipType, and relatedToPersonId", async () => {
