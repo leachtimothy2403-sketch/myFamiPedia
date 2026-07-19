@@ -31,9 +31,11 @@
 // Requires ANTHROPIC_API_KEY in the repo root .env — the same key the app
 // itself needs for adaptive follow-ups, so if the real feature works today
 // this should too.
-// Optional: QA_EVAL_MAX_FOLLOWUPS (default 12) caps how many generated
-// follow-ups to run before stopping — otherwise the loop only ends when the
-// model itself stops (it doesn't reliably self-terminate).
+// Optional: QA_EVAL_MAX_FOLLOWUPS (default 45 — matching the curated bank's
+// own 45 questions, so a full run is a genuinely deep interview: 45 curated
+// + up to 45 follow-ups) caps how many generated follow-ups to run before
+// stopping — otherwise the loop only ends when the model itself stops (it
+// doesn't reliably self-terminate).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -41,7 +43,7 @@ import supertest from "supertest";
 import { createTestDb } from "../../tests/helpers/testDb";
 import { PERSONA_NAME, PERSONA_BIO, PERSONA_ANSWER_SYSTEM_PROMPT, BURIED_FACTS } from "./persona";
 
-const MAX_FOLLOWUPS = Number(process.env.QA_EVAL_MAX_FOLLOWUPS ?? 12);
+const MAX_FOLLOWUPS = Number(process.env.QA_EVAL_MAX_FOLLOWUPS ?? 45);
 
 interface QuestionRow {
   id: string;
@@ -58,6 +60,20 @@ interface TranscriptEntry {
   answer: string;
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// 2026-07-19 fix — a real run (42 questions in, mid-interview) hit "Claude
+// returned no text content" and the whole script died, losing every answer
+// gathered so far, including the persona's jazz-singing reveal — exactly
+// the kind of thing this eval exists to catch. The underlying cause wasn't
+// diagnosable from the old error (it swallowed the raw response entirely),
+// and a single bad/empty response from a long-running, many-call script
+// shouldn't be fatal on its own. Now retries transiently-bad responses
+// (empty content, 5xx, network errors) a few times with backoff, and logs
+// the raw response body on final failure so a *real* recurring problem is
+// actually diagnosable next time instead of a bare "no text content".
 async function callClaude(system: string | undefined, userPrompt: string, maxTokens: number): Promise<string> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -65,24 +81,44 @@ async function callClaude(system: string | undefined, userPrompt: string, maxTok
       "ANTHROPIC_API_KEY is not set. This eval needs the same key generateFollowUpQuestion uses in production — add it to the repo root .env."
     );
   }
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-5",
-      max_tokens: maxTokens,
-      ...(system ? { system } : {}),
-      messages: [{ role: "user", content: userPrompt }],
-    }),
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Claude request failed (${res.status}): ${body}`);
+
+  const maxAttempts = 3;
+  let lastError: Error | undefined;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-5",
+          max_tokens: maxTokens,
+          ...(system ? { system } : {}),
+          messages: [{ role: "user", content: userPrompt }],
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`Claude request failed (${res.status}): ${body}`);
+      }
+      const rawBody = await res.text();
+      const data = JSON.parse(rawBody) as { content: { type: string; text?: string }[]; stop_reason?: string };
+      const text = data.content?.find((b) => b.type === "text")?.text?.trim();
+      if (!text) {
+        throw new Error(
+          `Claude returned no text content (stop_reason: ${data.stop_reason ?? "unknown"}). Raw response: ${rawBody.slice(0, 500)}`
+        );
+      }
+      return text;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (attempt < maxAttempts) {
+        const backoffMs = attempt * 2000;
+        console.warn(`  (Claude call failed on attempt ${attempt}/${maxAttempts}, retrying in ${backoffMs}ms: ${lastError.message})`);
+        await sleep(backoffMs);
+      }
+    }
   }
-  const data = (await res.json()) as { content: { type: string; text?: string }[] };
-  const text = data.content.find((b) => b.type === "text")?.text?.trim();
-  if (!text) throw new Error("Claude returned no text content");
-  return text;
+  throw lastError ?? new Error("Claude call failed for an unknown reason");
 }
 
 async function answerAsPersona(transcript: TranscriptEntry[], question: string): Promise<string> {
@@ -138,58 +174,97 @@ async function main() {
   let curatedCount = 0;
   let followupCount = 0;
 
+  // 2026-07-19 fix — a transient failure partway through a long run (a real
+  // one hit this at question 42/90) used to take the whole transcript down
+  // with it. Writes whatever was gathered so far, clearly labeled as
+  // incomplete, rather than losing it — the answers already collected are
+  // still worth reading even without a grading pass, and rerunning a 90-question
+  // interview from scratch over one bad API response is expensive for no reason.
+  function writeReport(gradingReport: string | null, incomplete: boolean) {
+    const transcriptText = transcript
+      .map((t) => `${t.index}. [${t.source}/${t.lifePhase}] Q: ${t.question}\nA: ${t.answer}`)
+      .join("\n\n");
+    const outPath = path.join(
+      process.cwd(),
+      `qa-persona-eval-report-${Date.now()}${incomplete ? "-INCOMPLETE" : ""}.md`
+    );
+    const fullReport = `# Adaptive Q&A persona eval report${incomplete ? " (INCOMPLETE — the run failed partway through, see below)" : ""}
+
+Persona: ${PERSONA_NAME}
+Curated questions answered: ${curatedCount}
+Follow-up questions answered: ${followupCount}
+
+## Transcript
+
+${transcriptText}
+
+## Grading
+
+${gradingReport ?? "(not run — the interview loop failed before reaching the grading pass; see the console error above)"}
+`;
+    fs.writeFileSync(outPath, fullReport);
+    console.log(`Report written to ${outPath}`);
+    return outPath;
+  }
+
   console.log("\nStarting interview loop...\n");
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const nextRes = await request()
-      .get(`/api/v1/interview-questions/next?personId=${personId}`)
-      .set("Authorization", `Bearer ${accessToken}`);
+  try {
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const nextRes = await request()
+        .get(`/api/v1/interview-questions/next?personId=${personId}`)
+        .set("Authorization", `Bearer ${accessToken}`);
 
-    if (nextRes.status === 204) {
-      console.log("GET /interview-questions/next returned 204 (nothing left) — stopping.");
-      break;
+      if (nextRes.status === 204) {
+        console.log("GET /interview-questions/next returned 204 (nothing left) — stopping.");
+        break;
+      }
+      if (nextRes.status !== 200) {
+        throw new Error(`GET /interview-questions/next failed: ${nextRes.status} ${JSON.stringify(nextRes.body)}`);
+      }
+      const q = nextRes.body as QuestionRow;
+      const isGenerated = q.source === "generated";
+
+      if (isGenerated && followupCount >= MAX_FOLLOWUPS) {
+        console.log(`Reached QA_EVAL_MAX_FOLLOWUPS (${MAX_FOLLOWUPS}) — stopping.`);
+        break;
+      }
+
+      const answerText = await answerAsPersona(transcript, q.text);
+
+      // Seeded directly, on purpose — see the file header on why this
+      // bypasses POST /interview-sessions/:id/answers (audio-only) rather
+      // than faking audio, while still exercising the real
+      // question-selection/generation endpoint above unchanged.
+      await db("interview_answers").insert({
+        session_id: sessionId,
+        question_id: q.id,
+        audio_r2_key: "eval://not-a-real-recording",
+        transcript: answerText,
+      });
+
+      if (isGenerated) followupCount++;
+      else curatedCount++;
+
+      transcript.push({
+        index: transcript.length + 1,
+        source: isGenerated ? "generated" : "curated",
+        lifePhase: q.life_phase,
+        question: q.text,
+        answer: answerText,
+      });
+      console.log(`[${transcript.length}] (${q.source}/${q.life_phase})\nQ: ${q.text}\nA: ${answerText}\n`);
     }
-    if (nextRes.status !== 200) {
-      throw new Error(`GET /interview-questions/next failed: ${nextRes.status} ${JSON.stringify(nextRes.body)}`);
-    }
-    const q = nextRes.body as QuestionRow;
-    const isGenerated = q.source === "generated";
-
-    if (isGenerated && followupCount >= MAX_FOLLOWUPS) {
-      console.log(`Reached QA_EVAL_MAX_FOLLOWUPS (${MAX_FOLLOWUPS}) — stopping.`);
-      break;
-    }
-
-    const answerText = await answerAsPersona(transcript, q.text);
-
-    // Seeded directly, on purpose — see the file header on why this bypasses
-    // POST /interview-sessions/:id/answers (audio-only) rather than faking
-    // audio, while still exercising the real question-selection/generation
-    // endpoint above unchanged.
-    await db("interview_answers").insert({
-      session_id: sessionId,
-      question_id: q.id,
-      audio_r2_key: "eval://not-a-real-recording",
-      transcript: answerText,
-    });
-
-    if (isGenerated) followupCount++;
-    else curatedCount++;
-
-    transcript.push({
-      index: transcript.length + 1,
-      source: isGenerated ? "generated" : "curated",
-      lifePhase: q.life_phase,
-      question: q.text,
-      answer: answerText,
-    });
-    console.log(`[${transcript.length}] (${q.source}/${q.life_phase})\nQ: ${q.text}\nA: ${answerText}\n`);
+  } catch (err) {
+    console.error("\nInterview loop failed — writing what was gathered so far before exiting.\n");
+    writeReport(null, true);
+    throw err;
   }
 
   console.log(`\nInterview complete — ${curatedCount} curated, ${followupCount} generated follow-up question(s).\n`);
   console.log("Running grading pass...\n");
 
-  const transcriptText = transcript
+  const transcriptTextForGrading = transcript
     .map((t) => `${t.index}. [${t.source}/${t.lifePhase}] Q: ${t.question}\nA: ${t.answer}`)
     .join("\n\n");
 
@@ -202,7 +277,7 @@ ${BURIED_FACTS.map((f, i) => `${i + 1}. ${f}`).join("\n")}
 
 Full interview transcript:
 
-${transcriptText}
+${transcriptTextForGrading}
 
 Grade this interview's coverage of the person's life story. Respond in exactly this structure:
 
@@ -220,28 +295,38 @@ REPEATED OR NEAR-DUPLICATE QUESTIONS:
 NOTES:
 <anything else worth flagging about question quality, register (too specific vs. appropriately general), or pacing>`;
 
-  const gradingReport = await callClaude(undefined, gradingPrompt, 1200);
+  // Scales with transcript length rather than a fixed cap — a fixed 1200
+  // was tuned against a short test run and silently truncated mid-sentence
+  // once a real run (15 curated + a couple dozen follow-ups) gave the
+  // grading pass that much more to summarize. 120 tokens/entry plus a fixed
+  // base comfortably covers the structured sections below even for a long
+  // interview; capped at 6000 as a sanity ceiling (only a ceiling — Claude
+  // is billed for tokens actually generated, not this cap, so erring high
+  // here is free).
+  const gradingMaxTokens = Math.min(6000, 800 + transcript.length * 120);
 
-  const outPath = path.join(process.cwd(), `qa-persona-eval-report-${Date.now()}.md`);
-  const fullReport = `# Adaptive Q&A persona eval report
+  let gradingReport: string;
+  try {
+    gradingReport = await callClaude(undefined, gradingPrompt, gradingMaxTokens);
+  } catch (err) {
+    console.error("\nGrading pass failed — writing the transcript without it rather than losing the interview.\n");
+    writeReport(null, true);
+    throw err;
+  }
 
-Persona: ${PERSONA_NAME}
-Curated questions answered: ${curatedCount}
-Follow-up questions answered: ${followupCount}
-
-## Transcript
-
-${transcriptText}
-
-## Grading
-
-${gradingReport}
-`;
-  fs.writeFileSync(outPath, fullReport);
-  console.log(`Report written to ${outPath}`);
+  writeReport(gradingReport, false);
 
   await db.destroy();
   await testDb.teardown();
+
+  // Importing src/index pulls in every BullMQ queue (jobs/queue.ts) as a
+  // side effect, same as the real API process — those hold open ioredis
+  // sockets that retry forever if Redis isn't reachable (or just stay open
+  // indefinitely if it is), which keeps the event loop alive with nothing
+  // left for this script to do. Without this, the terminal never returns to
+  // a prompt even though everything above already finished successfully —
+  // not a hang, just an explicit exit nothing else was going to trigger.
+  process.exit(0);
 }
 
 main().catch((err) => {
