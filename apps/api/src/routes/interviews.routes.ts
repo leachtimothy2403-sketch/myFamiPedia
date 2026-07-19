@@ -92,19 +92,57 @@ interviewsRouter.get("/interview-questions/next", requireAuth, async (req: Authe
         return null;
       }
 
-      const questionText = await generateFollowUpQuestion({
+      // 2026-07-19 fix — every question ever asked this person, text + life
+      // phase only (no answers, so it stays cheap even on a long interview),
+      // separate from priorAnswers' answer-level detail above which stays
+      // capped at 8 on purpose. See claude.service.ts's docstring: capping
+      // BOTH lists to 8 meant the model lost all memory of anything asked
+      // earlier than the last 8 questions and would re-ask substantively the
+      // same thing — caught by the persona eval on a real 40-question run
+      // (docs/handover_2026-07-19-qa-persona-eval.md).
+      const allAskedQuestions = await trx("interview_answers as ia")
+        .join("interview_sessions as s", "s.id", "ia.session_id")
+        .join("interview_questions as q", "q.id", "ia.question_id")
+        .where({ "s.person_id": subjectPersonId })
+        .orderBy("ia.created_at", "asc")
+        .select("q.text as question_text", "q.life_phase as question_life_phase");
+
+      // 2026-07-19 fix — category spread. Recent-first category sequence
+      // (chronological once reversed below) so generateFollowUpQuestion can
+      // tell whether the last few questions have all been the same one of
+      // the eighteen curated categories and, per Tim's direction after
+      // reviewing eval output, deliberately pick something different rather
+      // than staying parked on whatever's most recently discussed. A
+      // smaller window than allAskedQuestions above on purpose — this is
+      // about recent momentum, not full history (that's what the
+      // duplicate-avoidance list is for).
+      const recentCategoryRows = await trx("interview_answers as ia")
+        .join("interview_sessions as s", "s.id", "ia.session_id")
+        .join("interview_questions as q", "q.id", "ia.question_id")
+        .where({ "s.person_id": subjectPersonId })
+        .orderBy("ia.created_at", "desc")
+        .limit(6)
+        .select("q.life_phase as life_phase");
+      const recentCategories = recentCategoryRows.map((r: { life_phase: string }) => r.life_phase).reverse();
+
+      const followUp = await generateFollowUpQuestion({
         personName: person.name,
         priorQAs: priorAnswers.map((a: { question_text: string; answer_text: string; question_life_phase: string }) => ({
           question: a.question_text,
           answer: a.answer_text,
           lifePhase: a.question_life_phase,
         })),
+        priorQuestionTexts: allAskedQuestions.map((q: { question_text: string; question_life_phase: string }) => ({
+          question: q.question_text,
+          lifePhase: q.question_life_phase,
+        })),
+        recentCategories,
       });
 
       const [generated] = await trx("interview_questions")
         .insert({
-          text: questionText,
-          life_phase: "generated",
+          text: followUp.question,
+          life_phase: followUp.lifePhase,
           source: "generated",
           person_id: subjectPersonId,
           based_on_answer_ids: priorAnswers.map((a: { id: string }) => a.id),

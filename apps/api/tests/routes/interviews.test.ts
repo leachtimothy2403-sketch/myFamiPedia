@@ -1,8 +1,16 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { withApp, registerTestUser, type TestUser } from "../helpers/withApp";
 import { mockQueues, getQueueMock } from "../helpers/queueMock";
 
 mockQueues();
+
+// generateFollowUpQuestion makes a real Anthropic API call in production —
+// mocked here the same way this suite avoids other real external calls
+// (mockQueues for BullMQ). interviews.routes.ts imports it directly with no
+// dependency-injection seam, so a module mock is the only option.
+vi.mock("../../src/services/claude.service", () => ({
+  generateFollowUpQuestion: vi.fn(async () => ({ question: "A generated follow-up question?", lifePhase: "passions" })),
+}));
 
 describe("interviews", () => {
   const ctx = withApp();
@@ -45,6 +53,178 @@ describe("interviews", () => {
       .send({ personId: grandma.id });
     expect(res.body.person_id).toBe(grandma.id);
     expect(res.body.facilitator_person_id).toBe(user.personId);
+  });
+
+  // Closes the gap both adaptive-Q&A handover docs flagged: "no automated
+  // test yet for GET /interview-questions/next... worth adding, given how
+  // much the underlying logic and prompt have shifted." Written alongside
+  // the 2026-07-19 fix the persona eval (docs/handover_2026-07-19-qa-persona-eval.md)
+  // surfaced — see claude.service.test.ts for the prompt-construction half
+  // of that fix's coverage; this file covers the route's own selection
+  // logic (curated-first, generated-reuse, the priorQuestionTexts wiring).
+  describe("GET /interview-questions/next", () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
+
+    async function seedCuratedQuestions(count: number) {
+      const rows = Array.from({ length: count }, (_, i) => ({
+        text: `Curated question ${i + 1}?`,
+        life_phase: "childhood",
+        sort_order: i + 1,
+      }));
+      return ctx.knex()("interview_questions").insert(rows).returning("*");
+    }
+
+    async function createSession() {
+      const res = await ctx
+        .request()
+        .post("/api/v1/interview-sessions")
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ personId: user.personId });
+      return res.body.id as string;
+    }
+
+    // Seeded directly (bypassing the real, audio-only
+    // POST /interview-sessions/:id/answers) — same technique the persona
+    // eval script uses, and for the same reason: GET next's own selection
+    // logic is what's under test here, not the unrelated audio path.
+    async function answerDirectly(sessionId: string, questionId: string, transcript: string | null) {
+      await ctx.knex()("interview_answers").insert({
+        session_id: sessionId,
+        question_id: questionId,
+        audio_r2_key: "test://not-a-real-recording",
+        transcript,
+      });
+    }
+
+    it("works through the curated bank in sort_order before generating anything", async () => {
+      const questions = await seedCuratedQuestions(3);
+      const sessionId = await createSession();
+
+      const first = await ctx
+        .request()
+        .get(`/api/v1/interview-questions/next?personId=${user.personId}`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(first.status).toBe(200);
+      expect(first.body.id).toBe(questions[0].id);
+
+      await answerDirectly(sessionId, questions[0].id, "First answer");
+
+      const second = await ctx
+        .request()
+        .get(`/api/v1/interview-questions/next?personId=${user.personId}`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(second.status).toBe(200);
+      expect(second.body.id).toBe(questions[1].id);
+
+      const { generateFollowUpQuestion } = await import("../../src/services/claude.service");
+      expect(generateFollowUpQuestion).not.toHaveBeenCalled();
+    });
+
+    // The actual regression guard for the persona-eval finding: with more
+    // than 8 answered questions, the detailed priorQAs context is capped at
+    // 8 on purpose (cost), but priorQuestionTexts — the duplicate-avoidance
+    // list — must still carry every one of them, or the model loses
+    // visibility into anything asked earlier and can re-ask something
+    // substantively the same (seen for real: marriage-lessons asked three
+    // times over a 40-question interview).
+    it("passes every previously asked question to generateFollowUpQuestion, not just the most recent 8", async () => {
+      const questions = await seedCuratedQuestions(10);
+      const sessionId = await createSession();
+      for (const q of questions) {
+        await answerDirectly(sessionId, q.id, `Answer to ${q.text}`);
+      }
+
+      const res = await ctx
+        .request()
+        .get(`/api/v1/interview-questions/next?personId=${user.personId}`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(200);
+
+      const { generateFollowUpQuestion } = await import("../../src/services/claude.service");
+      expect(generateFollowUpQuestion).toHaveBeenCalledTimes(1);
+      const callArg = (generateFollowUpQuestion as ReturnType<typeof vi.fn>).mock.calls[0][0] as {
+        priorQAs: unknown[];
+        priorQuestionTexts: unknown[];
+        recentCategories: unknown[];
+      };
+      expect(callArg.priorQuestionTexts).toHaveLength(10);
+      expect(callArg.priorQAs).toHaveLength(8);
+      // recentCategories is a separate, smaller window (6) used only for the
+      // "don't camp on one category" rule, not duplicate-avoidance.
+      expect(callArg.recentCategories).toHaveLength(6);
+    });
+
+    // 2026-07-19 fix — every generated question used to be stored with a
+    // hardcoded life_phase of "generated", meaningless for tracking which of
+    // the eighteen real categories it belonged to, which made the
+    // "don't stay in one category too long" rule impossible to enforce. The
+    // route must persist whatever category generateFollowUpQuestion actually
+    // returned, not a placeholder.
+    it("stores the generated question under the real category generateFollowUpQuestion returned, not a placeholder", async () => {
+      const questions = await seedCuratedQuestions(1);
+      const sessionId = await createSession();
+      await answerDirectly(sessionId, questions[0].id, "An answer");
+
+      const res = await ctx
+        .request()
+        .get(`/api/v1/interview-questions/next?personId=${user.personId}`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(200);
+      expect(res.body.life_phase).toBe("passions"); // matches the module mock's return value above
+      expect(res.body.life_phase).not.toBe("generated");
+    });
+
+    it("reuses an unused previously-generated question instead of calling Claude again", async () => {
+      await seedCuratedQuestions(1);
+      const sessionId = await createSession();
+      const curated = await ctx.knex()("interview_questions").where({ source: "curated" }).first();
+      await answerDirectly(sessionId, curated.id, "Answered the only curated question");
+
+      const [existingGenerated] = await ctx
+        .knex()("interview_questions")
+        .insert({
+          text: "An already-generated, not-yet-answered follow-up?",
+          life_phase: "friendship",
+          source: "generated",
+          person_id: user.personId,
+        })
+        .returning("*");
+
+      const res = await ctx
+        .request()
+        .get(`/api/v1/interview-questions/next?personId=${user.personId}`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(200);
+      expect(res.body.id).toBe(existingGenerated.id);
+
+      const { generateFollowUpQuestion } = await import("../../src/services/claude.service");
+      expect(generateFollowUpQuestion).not.toHaveBeenCalled();
+    });
+
+    it("204s without calling Claude when curated is exhausted but nothing is transcribed yet", async () => {
+      const questions = await seedCuratedQuestions(1);
+      const sessionId = await createSession();
+      await answerDirectly(sessionId, questions[0].id, null);
+
+      const res = await ctx
+        .request()
+        .get(`/api/v1/interview-questions/next?personId=${user.personId}`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(204);
+
+      const { generateFollowUpQuestion } = await import("../../src/services/claude.service");
+      expect(generateFollowUpQuestion).not.toHaveBeenCalled();
+    });
+
+    it("404s for a nonexistent subject person", async () => {
+      const res = await ctx
+        .request()
+        .get(`/api/v1/interview-questions/next?personId=00000000-0000-0000-0000-000000000000`)
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(404);
+    });
   });
 
   describe("answers", () => {
