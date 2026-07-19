@@ -9,3 +9,7 @@ build/
 coverage/
 .turbo/
 _tmp_*
+
+# Generated, timestamped output from apps/api/scripts/personaQaEval/run.ts —
+# a manual eval report, not source. See docs/handover_2026-07-19-qa-persona-eval.md.
+apps/api/qa-persona-eval-report-*.md
