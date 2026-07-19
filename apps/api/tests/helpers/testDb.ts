@@ -71,6 +71,7 @@ export async function resetDb(knex: import("knex").Knex): Promise<void> {
   await knex.raw(`
     TRUNCATE TABLE
       notification_settings, notifications, flags,
+      interview_biography_sections,
       interview_answer_photos, interview_answers, interview_sessions, interview_questions,
       voice_models, invitations, holding_space,
       proposed_memories, photo_persons, photos,

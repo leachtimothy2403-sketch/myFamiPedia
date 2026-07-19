@@ -13,6 +13,7 @@ import { connection, embeddingQueue } from "./queue";
 import { withServiceContext } from "../db/pool";
 import { getObjectBuffer } from "../services/r2.service";
 import { transcriptionService as defaultTranscriptionService, TranscriptionService } from "../services/transcription.service";
+import { recordAnswerInBiography } from "../services/biography.service";
 
 export { connection };
 
@@ -20,12 +21,30 @@ export interface TranscribeJobData {
   interviewAnswerId: string;
 }
 
+export interface RecordBiographyParams {
+  personId: string;
+  personName: string;
+  lifePhase: string;
+  question: string;
+  answer: string;
+}
+
 export interface TranscriptionDeps {
   transcription: TranscriptionService;
   getBytes: (r2Key: string) => Promise<Buffer>;
+  // Injectable for the same reason transcription/getBytes are: this is a
+  // real Anthropic API call (biography.service.ts -> claude.service.ts), and
+  // tests need a fast, offline double rather than exercising it for real —
+  // especially since a real ANTHROPIC_API_KEY is often present in a local
+  // .env even when a given test has nothing to do with Claude.
+  recordBiography: (params: RecordBiographyParams) => Promise<void>;
 }
 
-const defaultDeps: TranscriptionDeps = { transcription: defaultTranscriptionService, getBytes: getObjectBuffer };
+const defaultDeps: TranscriptionDeps = {
+  transcription: defaultTranscriptionService,
+  getBytes: getObjectBuffer,
+  recordBiography: (params) => withServiceContext((trx) => recordAnswerInBiography(trx, params)),
+};
 
 // docs/voice_pipeline.md section 1, and the comment on interview_answer_photos
 // (migration 008): "the transcription worker copies these into memory_photos
@@ -73,6 +92,29 @@ export async function processTranscribeJob(data: TranscribeJobData, deps: Transc
     await trx("interview_answers").where({ id: interviewAnswerId }).update({ transcript, memory_id: memory.id });
     return memory.id;
   });
+
+  // 2026-07-19 fourth fix — keep the per-category running biography current
+  // (see biography.service.ts / migration 026) right where the transcript
+  // itself becomes known, so it's ready by the time the same session's next
+  // GET /interview-questions/next call needs it. Skipped for open-ended
+  // answers (no questionId, migration 021) — nothing to categorize under.
+  // Non-fatal like the synchronous-transcription try/catch in
+  // interviews.routes.ts's /answers handler: a Claude hiccup here shouldn't
+  // undo a transcript and memory that already saved successfully above.
+  if (context.question?.life_phase) {
+    try {
+      await deps.recordBiography({
+        personId: context.session.person_id,
+        personName: context.person.name,
+        lifePhase: context.question.life_phase,
+        question: context.question.text,
+        answer: transcript,
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(`[transcribeAnswer] biography update failed for answer ${interviewAnswerId}:`, err);
+    }
+  }
 
   await embeddingQueue.add("embed-memory", { memoryId });
   return { interviewAnswerId, memoryId, transcript };

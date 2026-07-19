@@ -36,10 +36,22 @@ describe("transcription worker", () => {
     const transcribe = vi.fn(async () => "I grew up in a small house by the river.");
     const transcription: TranscriptionService = { transcribe };
     const getBytes = vi.fn(async () => Buffer.from("fake-audio-bytes"));
+    // Injected the same way transcription/getBytes are — recordBiography is
+    // a real Anthropic API call in production (biography.service.ts), and
+    // this test has nothing to do with Claude, so it gets a fast, offline
+    // double rather than exercising the real thing.
+    const recordBiography = vi.fn(async () => {});
 
-    const result = await processTranscribeJob({ interviewAnswerId: answer.id }, { transcription, getBytes });
+    const result = await processTranscribeJob({ interviewAnswerId: answer.id }, { transcription, getBytes, recordBiography });
 
     expect(getBytes).toHaveBeenCalledWith("voice/answer-1.m4a");
+    expect(recordBiography).toHaveBeenCalledWith({
+      personId: subject.id,
+      personName: "Grandma",
+      lifePhase: "childhood",
+      question: "What was your childhood home like?",
+      answer: "I grew up in a small house by the river.",
+    });
 
     const memory = await knex("memories").where({ id: result.memoryId }).first();
     expect(memory).toBeTruthy();
@@ -59,6 +71,65 @@ describe("transcription worker", () => {
     const refreshedAnswer = await knex("interview_answers").where({ id: answer.id }).first();
     expect(refreshedAnswer.transcript).toBe("I grew up in a small house by the river.");
     expect(refreshedAnswer.memory_id).toBe(result.memoryId);
+  });
+
+  // migration 021 made questionId optional on interview_answers (mobile's
+  // "Share a memory" / "Start with a picture" open-ended starting points) —
+  // there's no life_phase to file a biography update under in that case, so
+  // recordBiography shouldn't even be attempted.
+  it("skips the biography update for an open-ended answer with no question attached", async () => {
+    const { processTranscribeJob } = await import("../../src/jobs/transcribeAnswer");
+    const knex = ctx.knex();
+
+    const [group] = await knex("family_groups").insert({ name: "Test Family" }).returning("*");
+    const [subject] = await knex("persons").insert({ family_group_id: group.id, name: "Grandma", status: "active" }).returning("*");
+    const [facilitator] = await knex("persons").insert({ family_group_id: group.id, name: "Grandchild", status: "active" }).returning("*");
+    const [session] = await knex("interview_sessions")
+      .insert({ person_id: subject.id, facilitator_person_id: facilitator.id, status: "in_progress" })
+      .returning("*");
+    const [answer] = await knex("interview_answers")
+      .insert({ session_id: session.id, question_id: null, audio_r2_key: "voice/answer-1.m4a" })
+      .returning("*");
+
+    const transcription: TranscriptionService = { transcribe: vi.fn(async () => "Just sharing a memory.") };
+    const getBytes = vi.fn(async () => Buffer.from("fake-audio-bytes"));
+    const recordBiography = vi.fn(async () => {});
+
+    await processTranscribeJob({ interviewAnswerId: answer.id }, { transcription, getBytes, recordBiography });
+
+    expect(recordBiography).not.toHaveBeenCalled();
+  });
+
+  // Same resilience principle as the /answers handler's synchronous-
+  // transcription try/catch (interviews.routes.ts): a transcript and memory
+  // that already saved successfully shouldn't be undone by a Claude hiccup
+  // in the biography update that follows.
+  it("doesn't fail the transcription job if the biography update throws", async () => {
+    const { processTranscribeJob } = await import("../../src/jobs/transcribeAnswer");
+    const knex = ctx.knex();
+
+    const [group] = await knex("family_groups").insert({ name: "Test Family" }).returning("*");
+    const [subject] = await knex("persons").insert({ family_group_id: group.id, name: "Grandma", status: "active" }).returning("*");
+    const [facilitator] = await knex("persons").insert({ family_group_id: group.id, name: "Grandchild", status: "active" }).returning("*");
+    const [question] = await knex("interview_questions").insert({ text: "What was your first job?", life_phase: "work" }).returning("*");
+    const [session] = await knex("interview_sessions")
+      .insert({ person_id: subject.id, facilitator_person_id: facilitator.id, status: "in_progress" })
+      .returning("*");
+    const [answer] = await knex("interview_answers")
+      .insert({ session_id: session.id, question_id: question.id, audio_r2_key: "voice/answer-1.m4a" })
+      .returning("*");
+
+    const transcription: TranscriptionService = { transcribe: vi.fn(async () => "Kessler's Department Store.") };
+    const getBytes = vi.fn(async () => Buffer.from("fake-audio-bytes"));
+    const recordBiography = vi.fn(async () => {
+      throw new Error("Claude request failed (500): internal error");
+    });
+
+    const result = await processTranscribeJob({ interviewAnswerId: answer.id }, { transcription, getBytes, recordBiography });
+
+    expect(result.transcript).toBe("Kessler's Department Store.");
+    const refreshedAnswer = await knex("interview_answers").where({ id: answer.id }).first();
+    expect(refreshedAnswer.transcript).toBe("Kessler's Department Store.");
   });
 
   it("throws a clear error for an unknown interview answer id", async () => {
