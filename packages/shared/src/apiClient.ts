@@ -253,13 +253,22 @@ export class ApiClient {
   // Batch registration only — each photo's bytes must already be PUT to R2
   // via a presignUpload({ context: "photo" }) URL before its r2Key is passed
   // here. Unlike completeUpload, this always runs the full detection +
-  // scene-classification + embedding pipeline and one family-wide clustering
-  // pass per call, since (unlike the pull path) nothing yet knows which of
-  // these photos are worth surfacing as a memory.
-  async syncCameraRoll(photos: { r2Key: string; takenAt?: string; location?: { lat: number; lng: number } }[]) {
+  // scene-classification + embedding pipeline. Clustering runs once per call
+  // by default; pass skipClustering: true when registering one sync session
+  // in several chunks and call triggerCameraRollClustering() once at the end
+  // instead — otherwise a single real event that straddles a chunk boundary
+  // gets split into multiple disjoint clusters (2026-07-19 fix).
+  async syncCameraRoll(
+    photos: { r2Key: string; takenAt?: string; location?: { lat: number; lng: number } }[],
+    options: { skipClustering?: boolean } = {}
+  ) {
     return this.request<{ items: { id: string }[] }>("/collection/camera-roll/sync", {
       method: "POST",
-      body: { photos },
+      body: { photos, skipClustering: options.skipClustering ?? false },
     });
+  }
+
+  async triggerCameraRollClustering() {
+    return this.request<{ enqueued: boolean }>("/collection/camera-roll/cluster", { method: "POST" });
   }
 }
