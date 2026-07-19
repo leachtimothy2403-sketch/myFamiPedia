@@ -199,6 +199,49 @@ Root cause: `auth.routes.ts`'s `issueTokens` sets the access token's `expiresIn`
 
 **Git status as of this fix:** not committed yet — see the newest commit block at the end of the "Git — commands to run" section below.
 
+## 2026-07-20 — CI failure: biography.service.test.ts's ANTHROPIC_API_KEY mock never actually worked
+
+GitHub Actions failed on this branch — 4 failures, all `recordAnswerInBiography` calls in `biography.service.test.ts` throwing `updateBiographySectionSummary is not configured — set ANTHROPIC_API_KEY`. Never seen locally.
+
+Root cause: this file mutated `process.env.ANTHROPIC_API_KEY` directly in `beforeEach`/`afterEach` — the exact pattern already fixed elsewhere in `claude.service.test.ts` earlier in this doc (the "flaky ANTHROPIC_API_KEY-not-configured tests" section above), just never applied here too. `config/env.ts` reads `process.env` once, at module-import time, into a plain `env` object every other module (including `claude.service.ts`) reads from — never `process.env` directly. Mutating `process.env` after that object already exists does nothing. Locally this was invisible because Tim's real `.env` has a working key, so `env.anthropicApiKey` was already truthy before any test ran regardless of what the beforeEach did. CI has no `.env` and no `ANTHROPIC_API_KEY` secret for this job, which is what actually exposed it.
+
+**Fix:** mocked `config/env.ts` directly, same as the earlier fix — but with one difference from that fix: this file (unlike `claude.service.test.ts`) also needs a real DB connection through `withDb()`, and `src/db/knexfile.ts` reads `env.databaseUrl` from this exact same module. A bare `vi.mock` returning only `{ anthropicApiKey }` would have blown away `databaseUrl`/`nodeEnv`/everything else and broken the DB connection for the whole file. Used `importOriginal()` instead, keeping the real `env` (built after `createTestDb()` has already pointed `DATABASE_URL` at the throwaway pglite instance, since nothing in this file imports `config/env` until `withDb()`'s `beforeAll` dynamically imports `db/pool.ts`) and overriding only `anthropicApiKey`.
+
+## 2026-07-20 — 4 pre-existing R2-credential test failures (same root cause pattern, third time)
+
+Tim flagged 4 known local failures (`collection.test.ts` x2, `memories.test.ts`, `photos.test.ts`) — `photoUrl` coming back as a real signed URL instead of the `null` these tests assert. Same underlying pattern as the ANTHROPIC_API_KEY bugs above, a third time: `r2.service.ts`'s `getClient()` throws only when `env.r2.accountId`/`accessKeyId`/`secretAccessKey` are empty, and `safePresignDownload` (photos.routes.ts/memories.routes.ts/collection.routes.ts) relies on that throw to degrade to `null`. `getSignedUrl` is a pure local signature computation — no network call — so if real R2 credentials are sitting in the repo root `.env` (needed there for actual local dev against a real bucket), `env.r2.*` picks them up the same way `env.anthropicApiKey` did, `getClient()` doesn't throw, and `presignDownload` quietly succeeds with a real-looking signed URL instead of the `null` these tests exist to pin down.
+
+**Fix, at the actual choke point this time rather than per-file:** `tests/helpers/testDb.ts`'s `createTestDb()` already forces deterministic values for `DATABASE_URL`/`NODE_ENV`/JWT secrets before any application code is imported — every route and worker test boots through this one function (`withApp.ts` and `withDb.ts` both call it). Added `process.env.R2_ACCOUNT_ID/R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY = ""` there too, unconditionally (not `??`-defaulted like the JWT secrets, since these three specifically need to be forced empty regardless of `.env` for the "not configured" test behavior to be deterministic). Fixes all 4 failures in one place instead of four separate per-file mocks; verified no test in the suite expects a successful real-credential presign path (checked `uploads.test.ts` too, since `POST /uploads/presign` also goes through `presignUpload` — its one test only exercises the 400 validation path before reaching that code).
+
+## 2026-07-20 — extending the biography beyond Q&A: direct memory shares + photo captions
+
+Tim's question, after the biography feature above landed: memories can also come from sharing a memory directly (`POST /memories`) or starting from a photo (`collection.routes.ts`'s proposed-memory accept flow) — can those two avenues populate the running biography too, not just the Q&A interview?
+
+Yes, but neither path had what an interview answer gets for free: a `life_phase`. `interview_answers` always traces back to a category through its `question_id` → `interview_questions.life_phase`. `memories` (migration 005) has no such column at all — `provenance_type` describes *how* something was captured (voice/photo/text/ai_generated), not which of the eighteen life-story categories it belongs to. Both alternate paths write into `memories`, completely bypassing `interview_answers`/`interview_biography_sections` entirely.
+
+**Three real design questions, resolved before writing any code:**
+
+1. **How does a freeform memory get a category at all?** New `classifyMemoryCategory(content)` in `claude.service.ts` — cheap Haiku-tier classification (same cost tier as the existing `classifyPhotoScene`), given the memory's text and the same eighteen-category list `generateFollowUpQuestion` already uses. Returns `null` rather than forcing a guess when the content is too thin/vague to confidently place (a bare caption like "Beach day!") — filing something that vague into a specific category would pollute that category's summary rather than inform it.
+
+2. **Whose biography does it belong to — the contributor, or whoever it's about?** A grandchild sharing a memory about grandma should inform grandma's biography, not the grandchild's. `memoryBiography.worker.ts` files under every `memory_persons`-tagged person if any are tagged, falling back to the contributor only when nobody else is (a memory about the contributor's own life, or tagging skipped). `memory_persons` only ever holds *active* tags — a still-pending tag (`holding_space`) correctly doesn't inform anyone's biography yet either, same as it doesn't show on anyone's profile yet.
+
+3. **What about `is_private`?** This is genuinely new territory — `interview_answers` has no privacy flag at all, everything from the Q&A flow was always fair game for the aggregate biography/`persons.ai_summary`. `memories` deliberately has `is_private`, and the whole point of that flag is the contributor chose to restrict who sees it. Folding a private memory into an aggregate document any family member can read (`GET /persons/:id/summary`) would quietly defeat that choice. Decided this without asking, since it's consistent with everything else this codebase already does around privacy (RLS policies, `persons_tree_view`'s opted-out masking): **private memories are always skipped.** Retracted memories are skipped too (a retraction landing between enqueue and processing is a real if rare race).
+
+**One design point that turned out to simplify things:** a photo-sourced memory from the accept flow starts with `content: null` — nothing to classify yet. Rather than needing separate handling for "direct share" vs. "photo, captioned later," the trigger is just "whenever a memory's content becomes non-empty" — `POST /memories` when content is provided at creation, or `PATCH /memories/:id` (the existing endpoint that closed the "photo memories have no way to add a caption" gap, see the section above from before this doc's Q&A-only scope) whenever a caption gets added later. Both routes now enqueue the same job; no changes needed in `collection.routes.ts` at all.
+
+**What changed:**
+
+- **`claude.service.ts`** — new `classifyMemoryCategory(content: string): Promise<InterviewCategory | null>`.
+- **`biography.service.ts`** — new `recordMemoryInBiography(trx, { personId, personName, lifePhase, content })`. Deliberately doesn't reuse `recordAnswerInBiography`'s `question` param with a fixed placeholder string: `asked_question_stems` isn't just display text (the "already asked in this category" list `generateFollowUpQuestion`'s prompt shows) — its *length* is also what `tallyCategoryCounts` reads as the whole-interview category tally that drives category-pacing, and `recordAnswerInBiography` dedupes identical stems. A fixed placeholder would silently stop that tally from incrementing after the first memory in any category. Uses a short excerpt of the memory's own content as the stem instead, so each one stays distinct.
+- **`jobs/queue.ts`** — new `memoryBiographyQueue` ("memory-biography"), its own queue rather than piggybacking on `embeddingQueue`: both fire from the same route moment, but classification + a biography-summary rewrite is a distinct job family from computing a search embedding, matching this file's existing one-queue-per-job-family convention.
+- **`jobs/memoryBiography.worker.ts`** (new) — `processUpdateBiographyFromMemoryJob`: loads the memory, skips (not errors) on no content / `is_private` / `retracted` / unclassifiable content, otherwise classifies once and records under every tagged person (or the contributor). DI'd deps (`classify`/`record`) for offline testing, same convention as `embedding.worker.ts`/`transcribeAnswer.ts`.
+- **`routes/memories.routes.ts`** — `POST /memories` enqueues `update-biography` when content is present; `PATCH /memories/:id` enqueues it when content is part of the update and the post-update value is non-empty (guards against an edit that clears content back to null/empty). Both off the request's critical path — classification + the summary rewrite are real Claude calls, same reasoning that already justified `embeddingQueue` for memory embedding rather than awaiting it inline.
+- **`jobs/runWorkers.ts`** — registers the new worker.
+- **Tests** — `memoryBiography.worker.test.ts` (new): contributor-fallback, tagged-person(s) filing (including 2 tagged people, 2 separate record calls), skip-on-no-content/private/retracted/unclassifiable, unknown-id error. `claude.service.test.ts`: `classifyMemoryCategory` — not-configured, happy path, case/whitespace normalization, explicit `NONE`, unparseable-response-returns-null-not-throws, prompt content. `biography.service.test.ts`: `recordMemoryInBiography` — creates/merges same as an interview answer would, distinct stems per memory (the tally-undercounting regression guard), prompt content. `memories.test.ts`: both routes enqueue (or correctly don't) the new queue.
+- **`tests/helpers/queueMock.ts`** — registered `memoryBiographyQueue` in the fake-queue allowlist (`mockQueues()` is an explicit list, not automatic — any route referencing a queue not listed here breaks every test using that route with an "undefined.add is not a function"-shaped failure).
+
+**Not yet done:** no real end-to-end verification yet — this needs a real run (share a memory, confirm `interview_biography_sections`/`GET /persons/:id/summary` actually picks it up) with `ANTHROPIC_API_KEY` and Redis/a worker process actually running, neither available in this sandbox. Static analysis + the new test suite are the only verification so far, same limitation as every fix in this doc. Also worth deciding later, not blocking now: whether a private memory should ever be able to inform a *private*, non-shared view of someone's biography (a two-tier biography) rather than being excluded outright — flagged as a possible future direction, not attempted here.
+
 ## Verification done so far
 
 Ran the harness end-to-end through DB boot, migrations, curated-question seeding, real account registration, real session creation, and the first real `GET /interview-questions/next` call (correctly returned curated question 1) — confirmed all of that plumbing works. Could not run a full persona interview or the grading pass in this sandbox, since neither has a real `ANTHROPIC_API_KEY` configured; the script correctly throws a clear, actionable error at that point rather than failing silently or with a confusing stack trace. **Not yet run for real** — that's the next step, on a machine with the real key.
@@ -547,4 +590,91 @@ circling back to the same core fact (leaving college over her father's
 failed business) - accepted as thematically justified given how
 central that event is to her story, not a bug, and documented as
 something to keep an eye on rather than something to fix."
+```
+
+```powershell
+git add apps/api/tests/services/biography.service.test.ts docs/handover_2026-07-19-qa-persona-eval.md
+git commit -m "Fix CI failure: biography.service.test.ts's ANTHROPIC_API_KEY mock never worked
+
+GitHub Actions failed with 4 recordAnswerInBiography calls throwing
+'not configured' - this file mutated process.env.ANTHROPIC_API_KEY
+directly, which does nothing once config/env.ts's env object is
+already built (same bug already fixed in claude.service.test.ts
+earlier this branch, just not applied here too). Invisible locally
+since Tim's real .env has a working key; CI has neither .env nor the
+secret, which exposed it.
+
+Mocked config/env.ts directly, but via importOriginal() rather than a
+bare vi.mock like the earlier fix - this file also needs a real DB
+connection through withDb(), and knexfile.ts reads env.databaseUrl
+from this same module. A bare mock would have broken the DB
+connection for the whole file; importOriginal() keeps the real env
+(built after createTestDb() already pointed DATABASE_URL at the
+throwaway pglite instance) and overrides only anthropicApiKey."
+
+git add apps/api/tests/helpers/testDb.ts
+git commit -m "Fix 4 pre-existing R2-credential test failures, at the actual choke point
+
+collection.test.ts (x2), memories.test.ts, photos.test.ts asserted
+photoUrl: null (the 'R2 not configured' degradation path) but got a
+real signed URL back instead - third occurrence of the same root cause
+as the ANTHROPIC_API_KEY bugs above: getSignedUrl is a pure local
+signature computation, no network call, so real R2 credentials sitting
+in the repo root .env (needed there for actual local dev) leak into
+env.r2.* the same way env.anthropicApiKey did, and safePresignDownload
+never gets the throw it's designed to catch.
+
+Fixed once at testDb.ts's createTestDb() - the one choke point every
+route/worker test already boots through - rather than four separate
+per-file mocks. R2_ACCOUNT_ID/ACCESS_KEY_ID/SECRET_ACCESS_KEY forced
+empty unconditionally (not ??-defaulted like the JWT secrets, which
+intentionally allow override) since these three specifically need to
+be deterministic regardless of .env. Verified no test in the suite
+expects a successful real-credential presign path."
+
+git add apps/api/src/services/claude.service.ts apps/api/src/services/biography.service.ts apps/api/src/jobs/queue.ts apps/api/src/jobs/memoryBiography.worker.ts apps/api/src/jobs/runWorkers.ts apps/api/src/routes/memories.routes.ts apps/api/tests/helpers/queueMock.ts apps/api/tests/routes/memories.test.ts apps/api/tests/services/claude.service.test.ts apps/api/tests/services/biography.service.test.ts apps/api/tests/jobs/memoryBiography.worker.test.ts docs/handover_2026-07-19-qa-persona-eval.md
+git commit -m "Extend the running biography to direct memory shares + photo captions
+
+Q&A answers weren't the only way biographical content enters this
+app - a memory can also be shared directly (POST /memories) or start
+from a photo (collection.routes.ts's accept flow). Both write into
+memories, which unlike interview_answers has no life_phase at all -
+provenance_type describes how something was captured, not which of
+the eighteen life-story categories it belongs to.
+
+New classifyMemoryCategory (claude.service.ts) - cheap Haiku
+classification, same cost tier as classifyPhotoScene - guesses the
+category from freeform content, returning null rather than forcing a
+guess when it's too vague to place. New recordMemoryInBiography
+(biography.service.ts) - doesn't reuse recordAnswerInBiography's
+question param with a fixed placeholder, since asked_question_stems'
+LENGTH is also what tallyCategoryCounts reads for category pacing and
+a fixed placeholder would dedupe every memory in a category down to
+one stem, silently undercounting; uses a content excerpt instead so
+each stays distinct.
+
+Files under every memory_persons-tagged person if any are tagged
+(falling back to the contributor only if nobody else is) - a
+grandchild sharing a memory about grandma should inform grandma's
+biography, not the grandchild's. Always skips is_private and retracted
+memories - new territory interview_answers never needed, since it has
+no privacy flag at all; folding a private memory into the
+family-readable aggregate summary would quietly defeat the
+contributor's choice to restrict it.
+
+New memoryBiographyQueue + memoryBiography.worker.ts, off the request's
+critical path (classification + the summary rewrite are real Claude
+calls) - same reasoning that already justified embeddingQueue over an
+inline await. POST /memories and PATCH /memories/:id both enqueue on
+non-empty content; no changes needed in collection.routes.ts at all,
+since a photo-sourced memory (content: null at creation) only ever
+gets real content via the PATCH path, which already covers it.
+
+New memoryBiography.worker.test.ts, plus new/updated tests in
+claude.service.test.ts, biography.service.test.ts, memories.test.ts.
+queueMock.ts's fake-queue allowlist updated (mockQueues() is an
+explicit list, not automatic).
+
+Not yet verified end-to-end - needs a real run with ANTHROPIC_API_KEY
+and a real Redis/worker process, neither available in this sandbox."
 ```
