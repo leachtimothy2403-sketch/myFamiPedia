@@ -3,6 +3,7 @@ import { requireAuth, AuthedRequest, requireFamilyAdministrator } from "../middl
 import { withRlsContext } from "../db/pool";
 import { HttpError } from "../utils/httpError";
 import { createPersonInvitation } from "./invitations.routes";
+import { presignDownload } from "../services/r2.service";
 
 export const photosRouter = Router();
 
@@ -11,6 +12,50 @@ export const photosRouter = Router();
 // working default so crowd-mode is testable end-to-end, not a settled
 // product decision — expect this to move once there's real usage data.
 const CROWD_MODE_THRESHOLD = 8;
+
+// Best-effort presign — matches the established pattern for R2 reads
+// elsewhere (scheduledJobs.worker.ts's grace-period cleanup, and
+// collection.routes.ts's GET /collection/proposed, which hit exactly this
+// gap first: presignDownload throws hard when R2 isn't configured, which is
+// correct for a write path but takes an otherwise-fine read endpoint down
+// with a 500 in any environment without R2 credentials set (e.g. the test
+// suite). A photo with no resolvable URL should render as "no preview
+// available" client-side, not break the request.
+async function safePresignDownload(r2Key: string): Promise<string | null> {
+  try {
+    return await presignDownload(r2Key);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(`presignDownload failed for ${r2Key}:`, err);
+    return null;
+  }
+}
+
+// Minimal single-photo lookup — a viewable URL plus enough to drive the
+// compose/tap-to-tag screen's initial render before it also calls
+// GET /photos/:id/faces. Nothing else in the API returned a presigned GET
+// URL for an arbitrary photo_id before this; GET /collection/proposed
+// (apps/api/src/routes/collection.routes.ts) resolves its own URLs inline
+// for review-queue cards specifically, but compose.tsx is reachable from
+// other entry points (the pull-path add flow first, proposal-accept later)
+// that don't go through that endpoint at all.
+photosRouter.get("/photos/:id", requireAuth, async (req: AuthedRequest, res, next) => {
+  try {
+    const { personId, familyGroupId } = req.auth!;
+    const photo = await withRlsContext({ personId, familyGroupId }, (trx) =>
+      trx("photos").where({ id: req.params.id }).first()
+    );
+    if (!photo) throw new HttpError(404, "Photo not found");
+    res.json({
+      id: photo.id,
+      photoUrl: await safePresignDownload(photo.r2_key),
+      faceCount: photo.face_count,
+      takenAt: photo.taken_at,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // Tap targets for the manual tagging flow (design doc section 1/2/7) — every
 // detected face on this photo, joined against any existing photo_persons tag

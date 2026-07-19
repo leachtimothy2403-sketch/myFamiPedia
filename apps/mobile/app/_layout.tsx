@@ -69,6 +69,9 @@ export default function RootLayout() {
             <Stack.Screen name="interview/session/[sessionId]" options={{ title: "Interview" }} />
             <Stack.Screen name="collection/review" options={{ title: "Review memories" }} />
             <Stack.Screen name="collection/manage" options={{ title: "Manage collection" }} />
+            <Stack.Screen name="collection/add-photo" options={{ title: "Add a photo" }} />
+            <Stack.Screen name="collection/compose" options={{ title: "Add details" }} />
+            <Stack.Screen name="collection/camera-roll-sync" options={{ title: "Sync camera roll" }} />
             <Stack.Screen name="collection/settings" options={{ title: "Collection settings" }} />
             <Stack.Screen name="admin/moderation-queue" options={{ title: "Moderation queue" }} />
             <Stack.Screen name="admin/deceased-profile/new" options={{ title: "Add a deceased profile" }} />

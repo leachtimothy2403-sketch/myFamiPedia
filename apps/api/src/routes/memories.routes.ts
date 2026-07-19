@@ -3,6 +3,7 @@ import { requireAuth, AuthedRequest, requireFamilyAdministrator } from "../middl
 import { withRlsContext } from "../db/pool";
 import { notificationQueue, embeddingQueue } from "../jobs/queue";
 import { HttpError } from "../utils/httpError";
+import { isValidDate } from "../utils/isValidDate";
 
 export const memoriesRouter = Router();
 
@@ -28,6 +29,9 @@ memoriesRouter.post("/memories", requireAuth, async (req: AuthedRequest, res, ne
     const resolvedProvenance = provenanceType ?? (mediaUrl || photoIds?.length ? "photo" : "text");
     if (!["voice", "photo", "text", "ai_generated"].includes(resolvedProvenance)) {
       return res.status(400).json({ error: "invalid provenanceType" });
+    }
+    if (eventDate != null && !isValidDate(eventDate)) {
+      return res.status(400).json({ error: "eventDate must be a valid YYYY-MM-DD date" });
     }
 
     const memory = await withRlsContext({ personId, familyGroupId }, async (trx) => {
@@ -86,6 +90,59 @@ memoriesRouter.post("/memories", requireAuth, async (req: AuthedRequest, res, ne
 
     await embeddingQueue.add("embed-memory", { memoryId: memory.id });
     res.status(201).json(memory);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Closes a gap flagged in docs/media_pipeline.md (2026-07-19 update):
+// accepting a proposed_memories candidate (POST /collection/proposed/:id/accept)
+// creates a bare `memories` row with no content, and there was previously no
+// way to add any afterward — collection/compose.tsx's tap-to-tag flow could
+// tag faces onto it (via POST /photos/:id/faces/:faceId/tag's memoryId
+// param) but never actually describe what the memory *is*. Contributor-only,
+// same permission shape as retract/restore/delete above. Deliberately
+// narrow: content and eventDate only — not personIds/photoIds/isPrivate,
+// which have their own dedicated write paths already (tap-to-tag for who's
+// in a photo, memory_photos at creation time) and would need real thought
+// about diffing add/remove semantics rather than a blind overwrite.
+memoriesRouter.patch("/memories/:id", requireAuth, async (req: AuthedRequest, res, next) => {
+  try {
+    const { personId, familyGroupId } = req.auth!;
+    const { content, eventDate } = req.body ?? {};
+    if (content === undefined && eventDate === undefined) {
+      return res.status(400).json({ error: "content or eventDate is required" });
+    }
+    if (eventDate !== undefined && eventDate !== null && !isValidDate(eventDate)) {
+      return res.status(400).json({ error: "eventDate must be a valid YYYY-MM-DD date" });
+    }
+
+    const memory = await withRlsContext({ personId, familyGroupId }, async (trx) => {
+      const existing = await trx("memories").where({ id: req.params.id }).first();
+      if (!existing) throw new HttpError(404, "Memory not found");
+      if (existing.contributor_id !== personId) {
+        throw new HttpError(403, "This memory cannot be edited by anyone other than its original contributor");
+      }
+      // Same restriction as delete/retract above — posthumous contributions
+      // only ever move through moderation, never a unilateral contributor edit.
+      if (existing.is_posthumous_contribution) {
+        throw new HttpError(403, "Posthumous-profile contributions cannot be self-edited — they go through moderation instead");
+      }
+
+      const updates: Record<string, unknown> = {};
+      if (content !== undefined) updates.content = content;
+      if (eventDate !== undefined) updates.event_date = eventDate;
+
+      const [updated] = await trx("memories").where({ id: existing.id }).update(updates).returning("*");
+      return updated;
+    });
+
+    // Only re-embed when content actually changed — an eventDate-only edit
+    // doesn't touch what semantic search matches against.
+    if (content !== undefined) {
+      await embeddingQueue.add("embed-memory", { memoryId: memory.id });
+    }
+    res.json(memory);
   } catch (err) {
     next(err);
   }

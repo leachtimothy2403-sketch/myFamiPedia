@@ -28,6 +28,167 @@ describe("memories", () => {
     return memory;
   }
 
+  // No coverage existed for POST /memories itself before — every other test
+  // in this file seeds a memories row directly via knex. Added alongside the
+  // eventDate fix: nothing validated eventDate's format before it hit a raw
+  // Postgres insert, so a value like "July 2026" (typed into
+  // collection/compose.tsx's free-text "When" field on mobile) surfaced as
+  // an uncaught driver error, and errorHandler.ts's fallback branch forwards
+  // err.message verbatim for anything that isn't a thrown HttpError — so the
+  // raw `invalid input syntax for type date` error reached the client
+  // directly. Also note: no route in this API validates against the zod
+  // schemas in packages/shared (createMemorySchema included) — this endpoint
+  // still does ad-hoc manual checks matching its existing style, not a zod
+  // parse; that's a wider, pre-existing gap, not something fixed here.
+  describe("POST /memories", () => {
+    it("creates a text memory with tagged persons and attached photos", async () => {
+      const [photo] = await ctx
+        .knex()("photos")
+        .insert({ family_group_id: user.familyGroupId, r2_key: "p.jpg", uploaded_by: user.personId })
+        .returning("*");
+
+      const res = await ctx
+        .request()
+        .post("/api/v1/memories")
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({
+          content: "A day at the beach",
+          eventDate: "2026-07-16",
+          provenanceType: "photo",
+          personIds: [user.personId],
+          photoIds: [photo.id],
+        });
+      expect(res.status).toBe(201);
+      expect(res.body.eventDate ?? res.body.event_date).toBeTruthy();
+
+      const memoryPersons = await ctx.knex()("memory_persons").where({ memory_id: res.body.id });
+      expect(memoryPersons).toHaveLength(1);
+      const memoryPhotos = await ctx.knex()("memory_photos").where({ memory_id: res.body.id });
+      expect(memoryPhotos).toHaveLength(1);
+    });
+
+    it("requires content or mediaUrl", async () => {
+      const res = await ctx
+        .request()
+        .post("/api/v1/memories")
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ provenanceType: "text" });
+      expect(res.status).toBe(400);
+    });
+
+    it("rejects an invalid provenanceType", async () => {
+      const res = await ctx
+        .request()
+        .post("/api/v1/memories")
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ content: "hi", provenanceType: "not-a-real-type" });
+      expect(res.status).toBe(400);
+    });
+
+    it("rejects a malformed eventDate (e.g. free text typed into the mobile 'When' field) with a clean 400, not a raw DB error", async () => {
+      const res = await ctx
+        .request()
+        .post("/api/v1/memories")
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ content: "Tour de France", provenanceType: "text", eventDate: "July 2026" });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/eventDate/i);
+      // The bug this guards against: previously this would 500 with the raw
+      // Postgres driver message leaking through errorHandler.ts's fallback
+      // branch instead of a clean validation error.
+      expect(res.body.error).not.toMatch(/invalid input syntax/i);
+    });
+
+    it("accepts a null eventDate (optional field)", async () => {
+      const res = await ctx
+        .request()
+        .post("/api/v1/memories")
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ content: "No date given", provenanceType: "text", eventDate: null });
+      expect(res.status).toBe(201);
+    });
+  });
+
+  // Closes the gap docs/media_pipeline.md flagged: accepting a proposed
+  // memory (POST /collection/proposed/:id/accept) creates a bare memory with
+  // no content and, before this endpoint existed, no way to add any.
+  describe("PATCH /memories/:id", () => {
+    it("updates content and re-enqueues embedding", async () => {
+      getQueueMock("embeddingQueue").add.mockClear();
+      const memory = await createMemory({ content: "original" });
+      const res = await ctx
+        .request()
+        .patch(`/api/v1/memories/${memory.id}`)
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ content: "updated content" });
+      expect(res.status).toBe(200);
+      expect(res.body.content).toBe("updated content");
+      expect(getQueueMock("embeddingQueue").add).toHaveBeenCalledWith("embed-memory", { memoryId: memory.id });
+    });
+
+    it("updates eventDate without re-enqueuing embedding (content unchanged)", async () => {
+      getQueueMock("embeddingQueue").add.mockClear();
+      const memory = await createMemory();
+      const res = await ctx
+        .request()
+        .patch(`/api/v1/memories/${memory.id}`)
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ eventDate: "2026-07-16" });
+      expect(res.status).toBe(200);
+      expect(res.body.event_date).toContain("2026-07-16");
+      expect(getQueueMock("embeddingQueue").add).not.toHaveBeenCalled();
+    });
+
+    it("rejects a malformed eventDate with a clean 400", async () => {
+      const memory = await createMemory();
+      const res = await ctx
+        .request()
+        .patch(`/api/v1/memories/${memory.id}`)
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ eventDate: "not-a-date" });
+      expect(res.status).toBe(400);
+    });
+
+    it("requires content or eventDate", async () => {
+      const memory = await createMemory();
+      const res = await ctx
+        .request()
+        .patch(`/api/v1/memories/${memory.id}`)
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({});
+      expect(res.status).toBe(400);
+    });
+
+    it("rejects an edit from anyone other than the contributor", async () => {
+      const memory = await createMemory();
+      const res = await ctx
+        .request()
+        .patch(`/api/v1/memories/${memory.id}`)
+        .set("Authorization", `Bearer ${other.accessToken}`)
+        .send({ content: "hijacked" });
+      expect(res.status).toBe(403);
+    });
+
+    it("404s on a nonexistent memory", async () => {
+      const res = await ctx
+        .request()
+        .patch(`/api/v1/memories/00000000-0000-0000-0000-000000000000`)
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ content: "x" });
+      expect(res.status).toBe(404);
+    });
+
+    it("rejects editing a posthumous contribution — moderation-only, same rule as delete/retract", async () => {
+      const memory = await createMemory({ is_posthumous_contribution: true });
+      const res = await ctx
+        .request()
+        .patch(`/api/v1/memories/${memory.id}`)
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ content: "edited" });
+      expect(res.status).toBe(403);
+    });
+  });
+
   it("reacts to a memory idempotently (onConflict ignore)", async () => {
     const memory = await createMemory();
     const res1 = await ctx

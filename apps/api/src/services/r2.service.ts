@@ -51,6 +51,17 @@ export async function getObjectBuffer(key: string): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
+// Download direction for client-facing display — a short-lived GET URL the
+// mobile/web client loads an <Image>/<img> from directly, the object never
+// passing through Express. Distinct from getObjectBuffer above, which pulls
+// the actual bytes server-side for forwarding into another API. First caller
+// is GET /collection/proposed (review-queue thumbnails); tap-to-tag will need
+// this too once that UI exists.
+export async function presignDownload(key: string): Promise<string> {
+  const command = new GetObjectCommand({ Bucket: env.r2.bucket, Key: key });
+  return getSignedUrl(getClient(), command, { expiresIn: PRESIGN_EXPIRY_SECONDS });
+}
+
 // Needed by the daily cron sweep's grace-period expiry step (docs/media_pipeline.md
 // section 4: "holding_space rows... deleted (DB rows + R2 objects per
 // lifecycle rule)"). The sweep calls this best-effort — a missing R2

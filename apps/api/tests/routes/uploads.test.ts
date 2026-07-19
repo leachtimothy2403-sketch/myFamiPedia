@@ -6,9 +6,14 @@ mockQueues();
 
 // No test file existed for this route before — it had zero coverage.
 // Written alongside the fix that makes POST /uploads/:id/complete enqueue
-// the photo pipeline (face detection, embedding, scene classification,
-// clustering) the same way camera-roll sync does, since previously a
-// manually-uploaded single photo got a `photos` row and nothing else.
+// face detection + embedding for a manually-uploaded photo, since previously
+// it got a `photos` row and nothing else. Deliberately NOT scene
+// classification or clustering: this endpoint is the "pull" entry point
+// (docs/photo_pipeline_beta_architecture.md section 7) — the user
+// deliberately chose this photo, so there's nothing for classification/
+// clustering to decide. That's a later correction to this same test (it
+// originally asserted the full pipeline enqueue, matching an earlier version
+// of uploads.routes.ts that has since been narrowed).
 describe("uploads", () => {
   const ctx = withApp();
   let user: TestUser;
@@ -45,7 +50,7 @@ describe("uploads", () => {
       return upload;
     }
 
-    it("photo context creates a photos row and enqueues the full pipeline", async () => {
+    it("photo context creates a photos row and enqueues only face detection + embedding (pull path — no classification/clustering)", async () => {
       const upload = await createUpload("photo");
       const res = await ctx
         .request()
@@ -61,12 +66,14 @@ describe("uploads", () => {
 
       expect(getQueueMock("faceDetectionQueue").add).toHaveBeenCalledWith("detect", { photoId: res.body.photoId });
       expect(getQueueMock("embeddingQueue").add).toHaveBeenCalledWith("embed-photo", { photoId: res.body.photoId });
-      expect(getQueueMock("sceneClassificationQueue").add).toHaveBeenCalledWith("classify", { photoId: res.body.photoId });
-      expect(getQueueMock("photoClusteringQueue").add).toHaveBeenCalledWith("cluster", { familyGroupId: user.familyGroupId });
-      expect(getQueueMock("photoClusteringQueue").add).toHaveBeenCalledTimes(1);
+      // The whole point of the pull path: the user already decided this
+      // photo is a memory, so there's nothing for scene classification or
+      // clustering to triage — neither queue should be touched.
+      expect(getQueueMock("sceneClassificationQueue").add).not.toHaveBeenCalled();
+      expect(getQueueMock("photoClusteringQueue").add).not.toHaveBeenCalled();
     });
 
-    it("memory context also creates a photos row and enqueues the pipeline", async () => {
+    it("memory context also creates a photos row and enqueues face detection + embedding only", async () => {
       const upload = await createUpload("memory");
       const res = await ctx
         .request()
@@ -76,6 +83,9 @@ describe("uploads", () => {
       expect(res.status).toBe(201);
       expect(res.body.photoId).toBeDefined();
       expect(getQueueMock("faceDetectionQueue").add).toHaveBeenCalledTimes(1);
+      expect(getQueueMock("embeddingQueue").add).toHaveBeenCalledTimes(1);
+      expect(getQueueMock("sceneClassificationQueue").add).not.toHaveBeenCalled();
+      expect(getQueueMock("photoClusteringQueue").add).not.toHaveBeenCalled();
     });
 
     it("voice context is a no-op — no photos row, no pipeline jobs", async () => {

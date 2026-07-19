@@ -35,6 +35,32 @@ describe("photos — tap-to-tag", () => {
     return { photo, faces };
   }
 
+  // No coverage existed for this endpoint before — added alongside its
+  // creation (collection/compose.tsx needed a viewable photo URL and
+  // nothing in the API returned a presigned GET URL for an arbitrary
+  // photo_id; GET /collection/proposed resolves its own URLs inline for
+  // review-queue cards specifically). photoUrl is expected to be null here,
+  // same as the GET /collection/proposed regression test in
+  // collection.test.ts: this test suite has no R2 credentials configured,
+  // and safePresignDownload degrades to null rather than 500ing — that
+  // resilience fix is what this null assertion is actually pinning down.
+  describe("GET /photos/:id", () => {
+    it("returns a photo's id, faceCount, takenAt, and a (possibly null) photoUrl", async () => {
+      const { photo } = await seedPhotoWithFaces(2);
+      const res = await ctx.request().get(`/api/v1/photos/${photo.id}`).set("Authorization", `Bearer ${admin.accessToken}`);
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ id: photo.id, faceCount: 2, photoUrl: null });
+    });
+
+    it("404s for a photo that doesn't exist", async () => {
+      const res = await ctx
+        .request()
+        .get("/api/v1/photos/00000000-0000-0000-0000-000000000000")
+        .set("Authorization", `Bearer ${admin.accessToken}`);
+      expect(res.status).toBe(404);
+    });
+  });
+
   describe("GET /photos/:id/faces", () => {
     it("returns tap targets with tag=null for untagged faces and crowdMode=false under the threshold", async () => {
       const { photo } = await seedPhotoWithFaces(2);

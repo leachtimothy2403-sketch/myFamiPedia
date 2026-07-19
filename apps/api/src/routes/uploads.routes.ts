@@ -4,7 +4,7 @@ import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { withRlsContext } from "../db/pool";
 import { presignUpload } from "../services/r2.service";
 import { HttpError } from "../utils/httpError";
-import { faceDetectionQueue, embeddingQueue, sceneClassificationQueue, photoClusteringQueue } from "../jobs/queue";
+import { faceDetectionQueue, embeddingQueue } from "../jobs/queue";
 
 export const uploadsRouter = Router();
 
@@ -88,18 +88,30 @@ uploadsRouter.post("/uploads/:id/complete", requireAuth, async (req: AuthedReque
       return { r2Key: upload.r2_key };
     });
 
-    // Previously only POST /collection/camera-roll/sync enqueued any of
-    // this — a manually-uploaded single photo got a `photos` row and
-    // nothing else: no face detection, no tap-to-tag targets, no scene
-    // classification, no clustering. Same job set as the sync route, just
-    // for a batch of one, so photoClusteringQueue still gets exactly one
-    // enqueue per completed upload rather than one per detected face.
+    // This endpoint is the "pull" entry point (design doc section 7): the
+    // user deliberately picked one photo and is about to say what it is and
+    // who's in it, as opposed to POST /collection/camera-roll/sync's
+    // "proactive" batch ingestion, where the system doesn't yet know which
+    // synced photos are worth surfacing at all. A deliberately-chosen photo
+    // has already answered the question scene classification and clustering
+    // exist to ask ("is this worth suggesting as a memory?", "does it belong
+    // to a cluster of other photos?") — the human just answered it by
+    // picking the photo. So unlike the sync route, this only enqueues face
+    // detection (tap-to-tag needs the bounding boxes) and embedding (search
+    // needs it regardless of source) — no scene-classification or
+    // clustering enqueue, and therefore no proposed_memories row either;
+    // the client goes straight to compose/tap-to-tag
+    // (apps/mobile/app/collection/compose.tsx) instead of the review queue.
+    // Previously (until this fix) this branch enqueued the full sync job
+    // set, which sent every manual add through Rekognition DetectLabels +
+    // Claude Haiku triage and the clustering pass despite the user's intent
+    // already being explicit — wasted vendor calls and the wrong UX (a
+    // photo the user chose on purpose could silently fail triage and never
+    // surface anywhere).
     if ("photoId" in result) {
       const photoId = result.photoId;
       await faceDetectionQueue.add("detect", { photoId });
       await embeddingQueue.add("embed-photo", { photoId });
-      await sceneClassificationQueue.add("classify", { photoId });
-      await photoClusteringQueue.add("cluster", { familyGroupId });
     }
 
     res.status(201).json(result);

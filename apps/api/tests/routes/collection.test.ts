@@ -83,13 +83,72 @@ describe("collection", () => {
       expect(res.body.items).toHaveLength(1);
     });
 
-    it("accept promotes a photo-sourced proposal to a real memory with its photo attached", async () => {
+    // Regression test: this endpoint used to 500 outright in any environment
+    // without R2 credentials configured (this test suite included —
+    // src/config/env.ts never sets R2_ACCOUNT_ID/etc here), because
+    // presignDownload throws hard when R2 isn't configured and the route
+    // called it unconditionally for every proposal. Fixed via
+    // safePresignDownload (best-effort, matching the pattern already used in
+    // scheduledJobs.worker.ts's R2 cleanup) — a proposal with no resolvable
+    // photo URL should still come back as a normal 200 with photoUrl: null,
+    // not take the whole list down.
+    it("resolves photo-sourced proposals to photoUrl/caption/photoCount without erroring when R2 isn't configured", async () => {
+      await createProposal();
+      const res = await ctx
+        .request()
+        .get("/api/v1/collection/proposed")
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(200);
+      expect(res.body.items).toHaveLength(1);
+      expect(res.body.items[0]).toMatchObject({
+        source: "photo",
+        photoUrl: null,
+        caption: null,
+        photoCount: 1,
+      });
+    });
+
+    it("resolves cluster-sourced proposals to the earliest photo by taken_at, with photoCount matching the cluster size", async () => {
+      const [photoA, photoB] = await Promise.all([
+        ctx
+          .knex()("photos")
+          .insert({ family_group_id: user.familyGroupId, r2_key: "later.jpg", uploaded_by: user.personId, taken_at: "2024-01-02" })
+          .returning("*")
+          .then(([p]: { id: string }[]) => p),
+        ctx
+          .knex()("photos")
+          .insert({ family_group_id: user.familyGroupId, r2_key: "earlier.jpg", uploaded_by: user.personId, taken_at: "2024-01-01" })
+          .returning("*")
+          .then(([p]: { id: string }[]) => p),
+      ]);
+      const [cluster] = await ctx.knex()("photo_clusters").insert({ family_group_id: user.familyGroupId }).returning("*");
+      await ctx.knex()("photo_cluster_photos").insert([
+        { cluster_id: cluster.id, photo_id: photoA.id },
+        { cluster_id: cluster.id, photo_id: photoB.id },
+      ]);
+      await ctx.knex()("proposed_memories").insert({ person_id: user.personId, status: "pending", cluster_id: cluster.id });
+
+      const res = await ctx
+        .request()
+        .get("/api/v1/collection/proposed")
+        .set("Authorization", `Bearer ${user.accessToken}`);
+      expect(res.status).toBe(200);
+      expect(res.body.items).toHaveLength(1);
+      expect(res.body.items[0]).toMatchObject({ source: "cluster", caption: null, photoCount: 2 });
+    });
+
+    it("accept promotes a photo-sourced proposal to a real memory with its photo attached, and returns memoryId/photoId for the client to navigate into compose", async () => {
       const proposal = await createProposal();
       const res = await ctx
         .request()
         .post(`/api/v1/collection/proposed/${proposal.id}/accept`)
         .set("Authorization", `Bearer ${user.accessToken}`);
-      expect(res.status).toBe(204);
+      expect(res.status).toBe(200);
+      expect(res.body.photoId).toBe(proposal.photo_id);
+      expect(res.body.memoryId).toBeDefined();
+
+      const memoryById = await ctx.knex()("memories").where({ id: res.body.memoryId }).first();
+      expect(memoryById).toBeDefined();
 
       const updated = await ctx.knex()("proposed_memories").where({ id: proposal.id }).first();
       expect(updated.status).toBe("accepted");
@@ -117,7 +176,9 @@ describe("collection", () => {
         .request()
         .post(`/api/v1/collection/proposed/${proposal.id}/accept`)
         .set("Authorization", `Bearer ${user.accessToken}`);
-      expect(res.status).toBe(204);
+      expect(res.status).toBe(200);
+      expect([photoA.id, photoB.id]).toContain(res.body.photoId);
+      expect(res.body.memoryId).toBeDefined();
 
       const memories = await ctx.knex()("memories").where({ contributor_id: user.personId });
       expect(memories).toHaveLength(1);
