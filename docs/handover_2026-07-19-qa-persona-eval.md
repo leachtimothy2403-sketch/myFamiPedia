@@ -78,6 +78,127 @@ A subsequent run hit the same underlying issue, but this time in `generateFollow
 
 Fixed at the source: `generateFollowUpQuestion` now goes through a new local `callAnthropic` helper with the same retry/backoff behavior as the eval script (3 attempts, short backoff, logs `stop_reason` on final failure instead of a bare "no text"). Two new tests in `claude.service.test.ts` — one confirming the error surfaces cleanly after all 3 attempts are exhausted, one confirming a transient empty response on attempts 1-2 followed by a good one on attempt 3 recovers transparently (the actual regression guard for this exact failure). Verified: `claude.service.test.ts` 7/7, `interviews.test.ts` 16/16 (unaffected, since it mocks the whole module).
 
+## 2026-07-19 — second-order fix: max_tokens cutoff needs a bigger budget, not just a retry
+
+The plain retry fix above (`callAnthropic`) handled generic transient failures, but a subsequent real run (question 50, deep into the follow-up phase) hit the exact same symptom — "Claude returned no text content" — with `stop_reason: max_tokens` this time. That's a different failure shape masquerading as the same error: the model wasn't flaky, it was cut off mid-response before it ever got to emit a text block, because the fixed 250-token budget wasn't enough room for a longer prompt (by this point in a long interview, `priorQuestionTexts` alone can be dozens of lines). Retrying at the same `max_tokens` three times in a row is deterministic, not transient — it fails identically every time, so the existing retry loop was just burning three API calls to fail once, slowly.
+
+**Fix:** `callAnthropic` (and the eval script's equivalent, `callClaude` in `run.ts`) now distinguishes the two failure shapes. A generic empty response retries at the same budget, unchanged. An empty response specifically caused by `stop_reason: max_tokens` doubles the budget (capped at 2000) before the next attempt, so the retry actually has a chance of succeeding instead of repeating a request that's guaranteed to fail again. Also bumped the starting budget for `generateFollowUpQuestion`'s call from 250 to 500 tokens, and the eval's persona-answering call from 300 to 500, so the escalation path is needed less often in the first place.
+
+Two new tests in `claude.service.test.ts`: one mocks a `stop_reason: max_tokens` empty response followed by success, and asserts the second request's `max_tokens` was actually doubled (500 → 1000) rather than repeated; a second confirms a plain empty response (no `max_tokens` cutoff) does *not* escalate the budget, so the two failure paths stay properly distinguished. Verified against the real pglite suite: `claude.service.test.ts` 9/9, `interviews.test.ts` 16/16 (unaffected, mocks the whole module).
+
+## 2026-07-19 — third-order fix: category pacing (whole-interview, not just streaks) + curated bank gaps, from Tim's first full 90-question run
+
+Tim ran a full real interview (45 curated + 45 follow-ups, real `ANTHROPIC_API_KEY`) end to end for the first time and the grading pass scored it 91/100 — strong (4 of 5 buried facts surfaced, appropriately guarded; the 5th, the stage name and club, staying buried is arguably correct persona-consistency behavior, not a system failure). But the grading pass caught two real, fixable problems:
+
+**Category pacing.** The existing "3 categories in a row" streak rule (see the section above) only ever prevents *consecutive* repeats. It did nothing to stop a category from being revisited over and over with gaps in between — this run picked `community_faith` and `passions` 4 times each out of 45 follow-up slots, and `turning_points` also 4 times, while `parenthood`, `partnership`, and `childhood` only got 1 follow-up each. Concretely: Q40 and Q69 both asked some version of "where did you feel like you belonged," 29 questions apart, and got the same answer (the church basement) both times; Q41/51/62/87 all mined "things you do for yourself" with diminishing new information each time. The streak rule never fired for any of this because no single category ever ran 3-in-a-row — a real pacing bug the streak rule structurally can't see.
+
+**Fix** (`claude.service.ts`): `generateFollowUpQuestion` now also tallies how many times each of the eighteen categories has been asked across the *whole* interview — free to compute, since `priorQuestionTexts` (already passed in for duplicate-checking) already carries every question's life phase. The prompt shows this tally sorted least-to-most and instructs the model to prefer the low end, treating 3 as a soft ceiling for any one category unless every other category already has 3+ too. The deterministic fallback (`leastUsedCategory`, replacing the old `leastRecentlyUsedCategory`) now picks from this same whole-interview tally rather than just the short recent-streak window, for the same reason. No new data or DB query needed in `interviews.routes.ts` — this was purely a `claude.service.ts` change.
+
+Also added: an explicit instruction not to build a new question around a specific anecdote or story detail that already served as the centerpiece of an earlier answer — the same run's Q9 and Q63 both centered on the one "Walter never left a room without turning off the light" story, 54 questions apart. This is a best-effort prompt instruction rather than a mechanically-guaranteed fix (the model only has full visibility into anecdotes via `priorQAs`, still capped at the most recent 8 for cost reasons — a persona with one favorite illustrative story can still resurface it in two questions further apart than that window, and there's no cheap way to track "which anecdotes has this person already told" across an entire long interview without a much larger change). Flagged here as an accepted, not-fully-solved gap rather than overclaiming a fix.
+
+Two new tests in `claude.service.test.ts`: one confirms the whole-interview tally, the "soft ceiling" instruction, and the anecdote-reuse instruction all reach the prompt, and that the model picking a genuinely underused category (`parenthood`, 0 so far, vs. `passions` at 4) is what gets returned; the existing fallback test was updated to actually populate `priorQuestionTexts` with the categories it's asserting against, since the fallback no longer reads `recentCategories` at all.
+
+**Curated bank gaps.** Separately, the grading pass flagged concrete, easy, natural facts that never came up across the whole 90-question interview because no curated question in any of the eighteen categories ever invited them: a rescued-stray-cat childhood story (a specific, rich anecdote left completely untouched), named specific likes/dislikes, and a sensory smell/taste/sound memory. This isn't a follow-up-quality problem the way the Robert Chen / Doreen gaps were (section above) — it's a structural gap in the question bank itself, same category of fix as the 15→45 expansion, just smaller. Added three more curated questions (`SENSORY_AND_SPECIFICS` in `curatedQuestions.js`, sort_order 46-48): a childhood-pet/animal-companion question, a sensory-triggered-memory question, and a specific-likes-and-dislikes question — standard oral-history interviewing techniques for surfacing concrete detail a purely thematic question tends to skip past, not persona-specific padding. `seeds/001_interview_questions.js` now includes these for fresh environments; `migrations/024_add_sensory_and_specifics_questions.js` is the additive path for Tim's own already-seeded real DB, same pattern as migration 023 (no-op if the curated bank was never seeded, skips any question whose text already exists, safe to run more than once).
+
+Deliberately did NOT try to fix two other callouts from the same grading pass — Kessler's shoplifting-spotting skill and the switchboard-operator job, each mentioned once and never revisited — with a curated or follow-up-prompt change. Both are "go deeper on something already mentioned" requests, which is exactly the drill-into-one-specific-memory pattern `docs/handover_2026-07-17-adaptive-qa-round2.md`'s "Tour de France" fixation bug taught this system to actively avoid (see `claude.service.ts`'s docstring on why the adaptive follow-up stays in a general-life-question register rather than zooming into one detail). Building more of that back in for the sake of this one eval run's coverage score would reintroduce the exact failure mode round 2 fixed.
+
+**Second persona, for the "one persona might be an outlier" gap flagged earlier in this doc.** Added `scripts/personaQaEval/personaTerse.ts` — Walter "Bud" Okafor, a deliberately contrasting archetype: terse, literal, chronological, answers 1-3 flat factual sentences with no anecdotal warmth. Where Peggy's five buried facts are protected by reticence (she'll acknowledge a topic exists but deflects — "that's a different story"), Bud's five buried facts are protected only by brevity: he doesn't deflect or dodge anything, he simply states each one plainly, exactly once, with no emotional signposting, if a question specifically invites it, and otherwise never volunteers it — a harder needle for an adaptive system to notice than Peggy's clearly-flagged hedging. `run.ts` now takes an optional persona selector — a CLI arg (`tsx run.ts terse`, what `pnpm eval:qa-persona-terse` uses — no `cross-env` dependency needed, works identically in PowerShell/cmd/bash) or the `QA_EVAL_PERSONA` env var, defaulting to `peggy`. Report filenames now include the persona key (`qa-persona-eval-report-<persona>-<timestamp>.md`) so runs of both don't collide or get confused for one another.
+
+**Not yet run:** Bud's persona eval hasn't been run for real yet (no `ANTHROPIC_API_KEY` in this sandbox) — that's the natural next step, alongside a real re-run of Peggy's to confirm the category-pacing fix actually improves the Q40/Q69/Q41-51-62-87-style repeats on a fresh run.
+
+**Git status as of this fix:** nothing above is committed yet — see the newest commit block at the end of the "Git — commands to run" section below.
+
+## 2026-07-19 — fourth-order fix: the max_tokens escalation ceiling itself was too low
+
+Tim ran `pnpm eval:qa-persona` for real (Peggy, live Anthropic API) after the category-pacing fix above. It got through 65 questions cleanly — including a full watercolor-class Q&A — then died:
+
+```
+Error: Claude returned no text content (stop_reason: max_tokens) — cut off before any text was emitted at max_tokens=2000
+    at callAnthropic (...claude.service.ts:147:15)
+    at generateFollowUpQuestion (...claude.service.ts:287:16)
+    at ...interviews.routes.ts:128:24)
+Interview loop failed — writing what was gathered so far before exiting.
+Report written to apps/api/qa-persona-eval-report-peggy-1784488910344-INCOMPLETE.md
+```
+
+The script did the right thing (wrote an `-INCOMPLETE.md` report with all 65 questions rather than losing the run), but the underlying request still 500'd. This is the same failure class as the second-order fix above (stop_reason: max_tokens, zero text emitted) — except this time the *whole* escalation ladder from that fix (500 → 1000 → 2000, maxAttempts=3) got exhausted, not just the first attempt. Working theory: by question 65 the category-balance instructions from the third-order fix above have real teeth — most of the eighteen categories are already at or past the "3 is a soft ceiling" line, so satisfying "pick a near-least-used category, respect the streak rule, and don't reuse an old anecdote" is a harder judgment call for the model, and on this run it pushed the response past 2000 tokens before a complete text block ever came out.
+
+Fix: raised the ladder one more rung — `maxAttempts` 3→4, cap 2000→4000, so escalation now runs 500 → 1000 → 2000 → 4000. Applied in both `claude.service.ts`'s `callAnthropic` (the production code path that actually 500'd) and the eval script's own mirrored `callClaude` in `run.ts`, same as the second-order fix. Added a regression test reproducing the exact question-65 shape (three consecutive max_tokens cutoffs at 500/1000/2000, success on the fourth attempt at 4000) plus updated the "all retries exhausted" test's call-count assertion (3→4). Tim confirmed via `pnpm test`: **[not yet re-run since this fix — next step below]**.
+
+This is a mitigation, not a structural fix — `askedList` (every question ever asked, in full) keeps growing across a long interview with no cap, so the prompt itself keeps getting bigger and the model's task keeps getting harder as more categories hit the soft ceiling. 4000 tokens should have real headroom over what triggered this one failure, but if a future run exhausts *that* ceiling too, the right move is probably capping/summarizing `askedList` on very long interviews rather than doubling the ceiling a third time.
+
+## 2026-07-19 — fifth-order fix: running per-category biography, replacing `askedList` entirely
+
+Tim asked what a real `generateFollowUpQuestion` call actually cost, in dollars, by question 90 of the completed 90-question Peggy run. Reconstructed the exact prompt from the saved transcript (`qa-persona-eval-report-1784484279976.md`) rather than guessing: ~21,600 characters, and the single biggest, only-ever-growing piece of it was `askedList` (every question ever asked, ~1,700 words already at question 90 and uncapped) — not the capped-at-8 `priorQAs` context, which stays flat regardless of interview length. Rough estimate at current Sonnet 5 introductory pricing ($2/$10 per MTok through Aug 31 2026): ~1.4¢ for that one call, climbing every question after with no ceiling. Tim's question: would a running, per-category biography — merged in place rather than appended — flatten that curve, and could it double as a legacy document for the family if the interview subject passes away?
+
+Yes to both, and it closes an existing gap in the same motion: `persons.ai_summary` (migration 003) and `GET /persons/:id/summary` (`persons.routes.ts`) have existed since early in this project as an explicitly-flagged stub — the route's own comment called it "still a stub," and `claude.service.ts` had a dead `generateProfileSummary(_personId)` that only ever threw `"Not implemented"`, never called from anywhere. Nothing had ever been built to actually populate it.
+
+**What changed:**
+
+- **`migrations/026_interview_biography_sections.js`** (new) — one row per `(person_id, life_phase)`. `summary` (text), `asked_question_stems` (native `text[]`, same choice `based_on_answer_ids` on `interview_questions` already made and already proven to round-trip through knex/pg — deliberately not jsonb, sidesteps node-postgres's array-vs-jsonb serialization gotcha rather than working around it), `question_count`.
+- **`claude.service.ts`** — two new pure functions (no DB, same convention as `generateFollowUpQuestion`): `updateBiographySectionSummary` folds ONE new Q&A into the existing summary for ONE category, explicitly instructed to tighten/drop older material rather than grow past 5-6 sentences — this is what keeps the cost flat over a long interview instead of growing with it. `synthesizeBiography` assembles all non-empty section summaries into a flowing "who they were" narrative, built from the already-compact sections rather than the raw transcript, so it stays cheap regardless of interview length. The dead `generateProfileSummary` stub is gone, replaced by these two.
+- **`generateFollowUpQuestion`** — signature changed: `priorQuestionTexts` is gone, replaced by `biographySections: { lifePhase, summary, askedQuestionStems }[]`. The category tally (`tallyCategoryCounts`) now reads section lengths directly instead of scanning question text — it only ever needed each entry's `lifePhase` anyway, never the text. The prompt's duplicate/anecdote-reuse check now reads each category's own summary + asked-stems list instead of one 89-line flat list.
+- **`services/biography.service.ts`** (new) — the DB-orchestrating layer `claude.service.ts` deliberately doesn't have: `recordAnswerInBiography` (upsert one section per answered question) and `getBiographySections` (read side, used by both `/interview-questions/next` and session completion).
+- **`jobs/transcribeAnswer.ts`** — `recordAnswerInBiography` is called right where a transcript becomes known (the one place both the synchronous in-session path and the async `/complete` safety-net path both go through), skipped for open-ended answers with no `questionId` (nothing to categorize under), non-fatal via try/catch — same principle as the existing synchronous-transcription try/catch in the `/answers` handler: a Claude hiccup here shouldn't undo a transcript and memory that already saved. Added a `recordBiography` slot to `TranscriptionDeps` (same DI pattern `transcription`/`getBytes` already use) specifically so tests get a fast offline double instead of a real network call — worth calling out since a real `ANTHROPIC_API_KEY` is often present locally even in tests that have nothing to do with Claude (see the second-order fix section above on the pre-existing test failures that exact situation already caused elsewhere).
+- **`interviews.routes.ts`** — `GET /interview-questions/next` now reads `biographySections` instead of querying every prior question. `POST /interview-sessions/:id/complete` now regenerates `persons.ai_summary` from the current sections after marking a session complete (non-fatal, same resilience principle) — this is the actual legacy-document delivery: cheap because it's built from compact sections, not a raw transcript, and it lands in the exact endpoint (`GET /persons/:id/summary`) that's already been sitting there waiting for a writer.
+- **Tests** — `biography.service.test.ts` (new, DB-backed via `withDb`): first-answer-creates-a-row, second-answer-in-the-same-category-merges-not-duplicates, separate categories stay separate rows, the right data reaches the Claude call, empty-for-a-fresh-person. `claude.service.test.ts`: existing `generateFollowUpQuestion` tests updated to the new `biographySections` shape; new tests for `updateBiographySectionSummary` and `synthesizeBiography` (including "throws rather than calling Claude when every section is empty" — an empty/junk `ai_summary` would be worse than the honest `generated: false` the summary endpoint already returns). `transcription.worker.test.ts`: existing test updated to inject a `recordBiography` double and assert it's called with the right args; two new tests (skips for open-ended answers, doesn't fail the job if the biography update throws). `interviews.test.ts`: the old `priorQuestionTexts`-length test rewritten around seeded `interview_biography_sections` rows; two new tests on `/complete` covering `ai_summary` regeneration and the empty-sections no-op case; the module-level `vi.mock` for `claude.service.ts` extended to include `synthesizeBiography` (a module mock replaces the whole module, so every export the route actually calls has to be listed, not just the one directly under test).
+- **`tests/helpers/testDb.ts`** — added `interview_biography_sections` to `resetDb`'s `TRUNCATE` list so it doesn't leak state across tests.
+
+**Not yet done:** no real dollar comparison run yet (would need a fresh 90-question Peggy eval on this branch, measuring the actual prompt size at question 90 against the ~21,600-character baseline above) — worth doing once this is committed and Tim can run the eval for real. Also didn't wire a way to manually trigger `ai_summary` regeneration outside of session completion (e.g. if someone wants it refreshed without starting a new session) — `synthesizeBiography` is exported and DB-orchestration-free, so a future endpoint for that would be a small addition, not a redesign.
+
+**Git status as of this fix:** not committed yet — see the newest commit block at the end of the "Git — commands to run" section below.
+
+## 2026-07-19 — sixth-order fix: the eval script itself never populated the biography, so the live run it was meant to validate regressed hard
+
+Tim ran `pnpm eval:qa-persona` on this branch to check whether the fifth-order fix actually helped. It didn't — it made things noticeably worse. Coverage dropped 91 → 84, and the grading report showed the exact repetition failure mode this whole line of work was supposed to fix, but worse and later in the interview: roughly Q49–Q93 (nearly the entire follow-up portion) substantively re-asked earlier curated questions, six near-identical times each in several cases (meeting Walter: Q8/51/60/69/78/87; siblings/Doreen: eight separate asks; and so on). Tim also flagged the persona's own in-character reactions as a signal something was off: *"Oh, I think you may have asked me this a time or two already today!"*, *"Goodness, you really are determined to get this story out of me one more time!"*
+
+Root cause, found by reading `run.ts` closely: the eval script seeds each answer directly into `interview_answers` (`db("interview_answers").insert(...)`, deliberately bypassing `POST /interview-sessions/:id/answers` since it has no real audio to send — see the file's own header comment, unchanged reasoning). In production, `recordAnswerInBiography` only ever runs inside `transcribeAnswer.ts`'s `processTranscribeJob` — the one place a transcript becomes known, whether synchronously (`/answers`) or via the async queue safety net (`/complete`). The eval script's direct insert never goes through either path, so `interview_biography_sections` stayed completely empty for the entire run. `generateFollowUpQuestion` was correctly reading `biographySections` — there just weren't any: zero coverage signal, zero already-asked stems, for every one of the eighteen categories, for the whole interview. The old `priorQuestionTexts` mechanism it replaced never had this problem, because it queried `interview_answers`/`interview_questions` directly with a raw SQL join — a query that works correctly regardless of how a row got inserted. The new mechanism instead depends on an explicit write-through call, and this eval script's own answer-insertion bypass — chosen for a completely different, legitimate reason (no real audio pipeline to test against) — was a code path nothing had wired that call into.
+
+This is a real fragility worth being honest about, not just a one-off oversight: `interview_biography_sections` is only ever as accurate as every code path that can cause `interview_answers.transcript` to become non-null. Right now there are exactly two — `processTranscribeJob` (production, both entry points) and this eval script's direct insert (now fixed below) — but any future code path that sets a transcript directly (a bulk-import tool, an admin backfill script, a different test harness) would silently reintroduce this exact bug. Flagging as a known risk rather than pretending it's closed; the eval script itself is the fix for now.
+
+**Fix:** `run.ts` now calls `recordAnswerInBiography` explicitly, right after the direct `interview_answers` insert, passing the same `personId`/`personName`/`lifePhase`/`question`/`answer` the production job would have. Not wrapped in the same loose retry-and-continue style as the Claude-call retries elsewhere in this script — a failure here should be loud (logged, but the run continues rather than dying, since losing one category's coverage signal for one question is recoverable, unlike losing the whole transcript).
+
+**Not yet done:** haven't re-run the eval since this fix — that's the actual verification step. Given this makes every answered question do one more real Claude call (the biography-section update), a full 90-question run now makes roughly 90 more API calls than it did before any of this work started (one per curated + generated question, on top of the existing persona-answer and follow-up-generation calls) — worth knowing going in, not a surprise mid-run.
+
+**Git status as of this fix:** not committed yet — folded into a new commit block at the end of the "Git — commands to run" section below, kept separate from the fifth-order fix's commit since this was discovered and fixed afterward, against a live run.
+
+## 2026-07-19 — seventh-order fix: the fix for the sixth-order fix broke DB isolation itself
+
+Tim tried the sixth-order fix and hit a completely different failure before the interview loop even started:
+
+```
+error: delete from "interview_questions" - update or delete on table "interview_questions" violates foreign key constraint "interview_answers_question_id_fkey" on table "interview_answers"
+detail: 'Key (id)=(f99dfa51-fa8e-4786-a790-bcbc2856fce0) is still referenced from table "interview_answers".'
+```
+
+First guess was leftover state from an interrupted earlier run — wrong. Tim tried a fresh terminal and killed any lingering `node` processes; same failure, deterministically. That ruled out staleness and pointed at something structural in a supposedly-fresh boot.
+
+Root cause: the sixth-order fix added `import { recordAnswerInBiography } from "../../src/services/biography.service"` as a **static** top-level import in `run.ts`. `tests/helpers/testDb.ts`'s own docstring spells out exactly why that's unsafe in this file and I'd read it earlier in this same session: `config/env.ts` reads `process.env.DATABASE_URL` once, at module-import time, and static imports are hoisted to the top of a module regardless of where they're written — so application-code imports in this script have always been dynamic (`await import(...)`), placed inside `main()` *after* `createTestDb()` runs, specifically so `config/env.ts` doesn't load until `DATABASE_URL` has already been pointed at the throwaway pglite instance. The static import chain `run.ts -> biography.service.ts -> claude.service.ts -> config/env.ts` broke that ordering: `config/env.ts` evaluated before `main()` ever called `createTestDb()`, read whatever real `DATABASE_URL` was already in `process.env` (Tim's actual local dev database, from `.env`), and froze it into the `env` object. `createTestDb()` then dutifully set `process.env.DATABASE_URL` to the pglite URL — too late; `db/pool.ts`'s Knex connection had already been (or would be) configured from the frozen `env.databaseUrl`, pointed at Tim's real dev DB the whole time.
+
+The FK violation was `seedFn`'s `del()` correctly refusing to delete real `interview_questions` rows that real `interview_answers` in Tim's real dev database actually reference — exactly the scenario migrations 023/024 exist to avoid, just hit from an unexpected direction. Worse than the error message alone suggests: had the curated bank *not* had real answers against it (or an earlier run had never gotten this far), the script would have gone on to register a throwaway eval account and write fake interview sessions/answers straight into Tim's real database with no indication anything was wrong.
+
+**Fix:** moved `recordAnswerInBiography`'s import back to a dynamic `await import("../../src/services/biography.service")` inside `main()`, right alongside the existing dynamic imports of `db/pool.ts` and the seed module, after `createTestDb()`. Added an explicit comment at the top of the file next to the static imports explaining why this one specifically can't join them, so a future edit doesn't reintroduce the same thing a third time.
+
+**Not yet done:** haven't re-verified with a real run yet — this is a static-analysis fix (traced the import chain by hand, confirmed against `testDb.ts`'s own documented ordering requirement) rather than something reproduced and confirmed fixed in this sandbox, since real Anthropic API calls and Tim's own `.env` aren't available here. Worth double-checking, once this runs clean, that `db.migrate.latest()` didn't already apply migration 026 to Tim's real dev DB during the broken run before the `del()` failed — harmless if so (purely additive new table), but worth a quick confirmation rather than assuming.
+
+**Git status as of this fix:** not committed yet — folded into the same new commit block as the sixth-order fix, see the "Git — commands to run" section below.
+
+## 2026-07-19 — eighth-order fix: access token expired mid-run on a long interview
+
+A subsequent run got past the seventh-order fix cleanly (77 questions in, well past where the DB-isolation bug used to bite) and then died differently:
+
+```
+Error: GET /interview-questions/next failed: 401 {"error":"Invalid or expired token"}
+```
+
+Root cause: `auth.routes.ts`'s `issueTokens` sets the access token's `expiresIn` to `15m`. A 77+ question run makes three real Claude calls per question (persona answer, biography-section update, follow-up generation) plus whatever retry backoff any of those trigger — comfortably enough wall-clock time to outlive a 15-minute token on a run this long, something no earlier, shorter run had lasted long enough to hit.
+
+**Fix:** `run.ts` now tracks `accessToken`/`refreshToken` as mutable state (previously `const`, set once at registration) and wraps the loop's `GET /interview-questions/next` call in a new `fetchNextQuestion()` helper: on a 401, it calls `POST /auth/refresh` with the stored refresh token, swaps in the fresh pair, and retries once. A second 401 immediately after a fresh token surfaces as a real failure rather than looping forever — that would mean something else is actually wrong.
+
+**Result:** re-run completed the full interview end to end (Peggy, 90 questions) with no further script failures. Coverage came back strong; Tim's only callout was that questions 19, 32, 33, 34, 43, 68, and 85 all circled back to the same core fact (leaving college due to her father's failed business) from slightly different framings — judged thematically justified given how central that event is to her story, but collectively repetitive in the answers it produced. Logged here as an accepted result, not a bug to chase — the category-pacing and per-section duplicate-avoidance work earlier in this doc is about not re-asking the *same question*, not about capping how many *different* questions can legitimately lead back to one especially load-bearing fact. Worth watching on future runs/personas rather than acting on now.
+
+**Git status as of this fix:** not committed yet — see the newest commit block at the end of the "Git — commands to run" section below.
+
 ## Verification done so far
 
 Ran the harness end-to-end through DB boot, migrations, curated-question seeding, real account registration, real session creation, and the first real `GET /interview-questions/next` call (correctly returned curated question 1) — confirmed all of that plumbing works. Could not run a full persona interview or the grading pass in this sandbox, since neither has a real `ANTHROPIC_API_KEY` configured; the script correctly throws a clear, actionable error at that point rather than failing silently or with a confusing stack trace. **Not yet run for real** — that's the next step, on a machine with the real key.
@@ -178,4 +299,252 @@ error still surfaces cleanly after all retries are exhausted, one
 confirming a transient bad response followed by a good one recovers
 transparently. 7/7, plus 16/16 in interviews.test.ts (unaffected,
 mocks the whole module)."
+```
+
+```powershell
+git add apps/api/src/services/claude.service.ts apps/api/scripts/personaQaEval/run.ts apps/api/tests/services/claude.service.test.ts docs/handover_2026-07-19-qa-persona-eval.md
+git commit -m "callAnthropic: escalate token budget on max_tokens cutoff, raise the ceiling
+
+A real run hit 'no text content' again at question 50, this time with
+stop_reason: max_tokens - the model was cut off before emitting any
+text at the fixed 250-token budget. Retrying at the same budget three
+times is deterministic, not transient - it was guaranteed to fail
+identically every time.
+
+callAnthropic (and the eval's callClaude) now doubles max_tokens
+specifically when the empty response is a max_tokens cutoff, leaving
+plain transient empty responses on the existing same-budget retry
+path. Starting budgets bumped 250->500 (generateFollowUpQuestion) and
+300->500 (persona answers) so the escalation path is needed less
+often.
+
+A second live run (90-question Peggy eval, after the category-pacing
+prompt additions below) hit the SAME wall again at question 65, but
+this time exhausted the whole ladder: 500 -> 1000 -> 2000 all cut off
+with zero text, at the old maxAttempts=3 / 2000-token cap. Deeper into
+a long interview the category-balance instructions get harder to
+satisfy (most categories already past the soft ceiling), which seems
+to make the category choice a harder call for the model and pushed it
+past the old ceiling. Ladder is now 500 -> 1000 -> 2000 -> 4000
+(maxAttempts 3->4, cap 2000->4000), mirrored in both callAnthropic and
+the eval's own callClaude.
+
+Four tests now cover this: budget doubles and the retry succeeds on a
+max_tokens cutoff; a plain empty response leaves the budget unchanged;
+all retries exhausted surfaces a clear error (now 4 attempts, not 3);
+and a new regression test reproducing the exact question-65 shape
+(three consecutive max_tokens cutoffs at 500/1000/2000, success on the
+fourth at 4000). 10/10, plus 16/16 in interviews.test.ts (unaffected,
+mocks the whole module)."
+```
+
+```powershell
+git add apps/api/src/services/claude.service.ts apps/api/tests/services/claude.service.test.ts
+git commit -m "Fix category pacing: whole-interview tally, not just streaks
+
+The existing '3-in-a-row' rule only ever prevented consecutive
+repeats. A real 90-question run (45 curated + 45 follow-ups) picked
+community_faith and passions 4 times each, and turning_points 4
+times, while parenthood/partnership/childhood only got 1 - the
+streak rule never fired since no category ever ran 3-in-a-row,
+just kept resurfacing every 8-10 questions.
+
+generateFollowUpQuestion now tallies category counts across the
+WHOLE interview (free - derived from priorQuestionTexts, no new
+data) and instructs the model to prefer the least-used categories,
+treating 3 as a soft ceiling. The parse-failure fallback
+(leastUsedCategory, replacing leastRecentlyUsedCategory) now uses
+this same whole-interview tally instead of just the recent-streak
+window. Also added an explicit instruction against reusing the same
+illustrative anecdote as the centerpiece of two different
+questions (Q9/Q63 both centered on the same 'turning off the
+lights' story).
+
+Two new/updated tests in claude.service.test.ts."
+
+git add apps/api/src/db/curatedQuestions.js apps/api/src/db/seeds/001_interview_questions.js apps/api/src/db/migrations/024_add_sensory_and_specifics_questions.js
+git commit -m "Add 3 curated questions closing concrete-detail gaps the eval caught
+
+A childhood pet/animal story, named specific likes/dislikes, and a
+sensory smell/taste/sound memory never came up across a full
+90-question interview - no curated question in any of the 18
+categories ever invited them. Standard oral-history interview
+techniques for surfacing concrete detail, not persona-specific
+padding. Deliberately did not add anything encouraging the adaptive
+model to 'go deeper' on something already mentioned once (e.g. the
+persona's shoplifting-spotting skill) - that's exactly the
+drill-into-one-memory pattern the round-2 'Tour de France' fixation
+bug taught this system to avoid.
+
+migrations/024 is the additive path for an already-seeded real DB,
+same pattern as migration 023."
+
+git add apps/api/scripts/personaQaEval/personaTerse.ts apps/api/scripts/personaQaEval/run.ts apps/api/package.json
+git commit -m "Add a second, contrasting persona for the Q&A eval
+
+Peggy (persona.ts) is warm and associative and deflects on sensitive
+topics with clear verbal hedging ('that's a different story') - an
+easy tell for an adaptive system to notice. Walter 'Bud' Okafor
+(personaTerse.ts) is terse and chronological and never deflects; his
+buried facts are protected only by brevity, stated flatly once if
+asked the right question, never volunteered otherwise - a harder
+needle to find, and the contrasting archetype flagged as a next step
+after Peggy's first full run (one persona's phrasing quirks could
+flatter or penalize the system independent of whether the underlying
+logic is sound).
+
+run.ts takes an optional persona selector (CLI arg or
+QA_EVAL_PERSONA env var, defaulting to peggy) - pnpm
+eval:qa-persona-terse runs Bud. Report filenames now include the
+persona key so runs of both don't collide."
+
+git add docs/handover_2026-07-19-qa-persona-eval.md
+git commit -m "Document category-pacing fix, curated bank additions, second persona"
+```
+
+```powershell
+git add apps/api/src/db/migrations/026_interview_biography_sections.js apps/api/src/services/biography.service.ts apps/api/src/services/claude.service.ts apps/api/src/jobs/transcribeAnswer.ts apps/api/src/routes/interviews.routes.ts apps/api/tests/services/biography.service.test.ts apps/api/tests/services/claude.service.test.ts apps/api/tests/jobs/transcription.worker.test.ts apps/api/tests/routes/interviews.test.ts apps/api/tests/helpers/testDb.ts
+git commit -m "Replace unbounded askedList with a running per-category biography
+
+generateFollowUpQuestion's duplicate/anecdote-reuse check used to read
+priorQuestionTexts, a flat list of every question ever asked this
+person - appended forever, no ceiling. Reconstructed a real call's
+actual prompt (question 90 of the completed 90-question Peggy eval)
+and confirmed it was the single biggest, only-ever-growing piece of
+it (~1,700 words already, dwarfing the capped-at-8 priorQAs context).
+Estimated cost at question 90: ~1.4 cents and climbing every question
+after, no ceiling.
+
+New migrations/026 table (interview_biography_sections): one row per
+(person, life_phase), continuously merged in place rather than
+appended to. New pure functions in claude.service.ts -
+updateBiographySectionSummary folds one new Q&A into the existing
+section, instructed to tighten/drop older material rather than grow
+past 5-6 sentences, which is what keeps this flat over a long
+interview instead of growing with it; synthesizeBiography assembles
+all sections into a flowing narrative. generateFollowUpQuestion now
+takes biographySections instead of priorQuestionTexts - same
+duplicate-avoidance guarantee (each section's own asked-question
+stems), bounded by content instead of by interview length.
+
+New biography.service.ts is the DB-orchestrating layer
+(recordAnswerInBiography, getBiographySections) claude.service.ts
+deliberately doesn't have. Wired into transcribeAnswer.ts right where
+a transcript becomes known (both the synchronous and async-safety-net
+paths go through it), skipped for open-ended answers with no
+question, non-fatal on failure. New recordBiography slot on
+TranscriptionDeps for the same DI-for-testability reason
+transcription/getBytes already have it.
+
+Second-order effect, not just a cost fix: this also implements
+persons.ai_summary / GET /persons/:id/summary, previously an
+explicitly-flagged stub nothing had ever written to
+(generateProfileSummary threw 'Not implemented', never called from
+anywhere - now removed). POST /interview-sessions/:id/complete
+regenerates it from the current sections when a session wraps up -
+built from compact sections, not the raw transcript, so it's cheap
+regardless of interview length. Doubles as a legacy document for the
+family if the interview subject passes away.
+
+10 new/updated tests across biography.service.test.ts (new, DB-backed:
+create/merge/separate-categories/empty-for-fresh-person),
+claude.service.test.ts (generateFollowUpQuestion tests updated to the
+new shape, new tests for both new pure functions), transcription.worker.test.ts
+(recordBiography injected and asserted, skip-on-open-ended,
+non-fatal-on-failure), interviews.test.ts (biography-sections wiring,
+ai_summary regeneration on /complete). testDb.ts's resetDb updated to
+truncate the new table."
+```
+
+```powershell
+git add apps/api/tests/services/claude.service.test.ts
+git commit -m "Fix flaky ANTHROPIC_API_KEY-not-configured tests
+
+These deleted process.env.ANTHROPIC_API_KEY and relied on
+vi.resetModules() forcing a fresh re-import of config/env.ts to pick
+that up - breaks silently whenever a real key is present in the repo
+root .env (Tim's own local setup), since env.ts's dotenv.config() only
+skips a var that's already set, so the fresh re-import's dotenv.config()
+call reloads the real key right back in. Was already one of the
+pre-existing failures flagged earlier in this doc; two new tests
+(updateBiographySectionSummary, synthesizeBiography) copied the same
+broken pattern before this was caught. Mocks config/env.ts directly
+instead, sidestepping .env entirely. Fixes all three, confirmed via
+pnpm test: down from 7 failures to 4 (the remaining 4 are the
+pre-existing, unrelated R2-credential ones)."
+```
+
+```powershell
+git add apps/api/scripts/personaQaEval/run.ts
+git commit -m "Eval: actually record answers into the running biography
+
+generateFollowUpQuestion now reads biographySections instead of
+querying interview_answers/interview_questions directly - but this
+script seeds each persona answer straight into interview_answers,
+bypassing POST /interview-sessions/:id/answers (no real audio to
+send) and therefore bypassing transcribeAnswer.ts's
+processTranscribeJob, the only place recordAnswerInBiography got
+called. interview_biography_sections stayed empty for an entire eval
+run as a result - confirmed by a live run that regressed hard
+(coverage 91->84) with the exact repetition failure mode this whole
+line of work was meant to fix, just later and worse (~Q49-93
+re-asking earlier curated questions, six times over in places). The
+old priorQuestionTexts mechanism it replaced never had this problem -
+it read straight from interview_answers/interview_questions with a
+raw SQL join, which works regardless of how a row got inserted.
+
+Calls recordAnswerInBiography explicitly right after the direct
+insert, passing what processTranscribeJob would have. Logged but
+non-fatal on failure - losing one category's coverage signal for one
+question is recoverable, losing the whole transcript isn't.
+
+Known residual risk, not fully closed: interview_biography_sections
+is only as accurate as every code path that can set
+interview_answers.transcript directly. Right now that's exactly two
+paths (processTranscribeJob, and this eval script's insert, now
+fixed) - a future bulk-import or backfill tool that sets a transcript
+directly would silently reintroduce this same bug.
+
+Second bug, found immediately after the first fix: recordAnswerInBiography
+was imported as a static top-level import, which pulls in
+biography.service.ts -> claude.service.ts -> config/env.ts before
+main() ever calls createTestDb() - breaking the exact ordering
+tests/helpers/testDb.ts's own docstring warns about (config/env.ts
+reads DATABASE_URL once, at import time; static imports are hoisted
+regardless of where they're written). config/env.ts locked onto
+Tim's real dev DATABASE_URL instead of the throwaway pglite one, and
+the seed script's del() correctly refused to delete real,
+already-answered interview_questions rows in his real database - the
+FK error that surfaced was the lucky early failure that stopped the
+script before it went on to write fake eval data into a real
+database. Moved the import back to a dynamic
+await import(...) inside main(), after createTestDb(), matching
+every other application-code import in this file, with a comment
+explaining why this one specifically can't be static."
+```
+
+```powershell
+git add apps/api/scripts/personaQaEval/run.ts docs/handover_2026-07-19-qa-persona-eval.md
+git commit -m "Eval: refresh access token mid-run instead of dying at 15 minutes
+
+A full 90-question run (77 questions in, past the earlier DB-isolation
+bug's failure point) died with 'GET /interview-questions/next failed:
+401 Invalid or expired token'. Access tokens expire after 15m
+(auth.routes.ts's issueTokens); a long run's three Claude calls per
+question plus any retry backoff comfortably outlasts that once the
+interview runs long enough - no earlier, shorter run had lived long
+enough to hit it.
+
+accessToken/refreshToken are now mutable, and the loop's next-question
+call goes through a new fetchNextQuestion() helper: on a 401, refresh
+via POST /auth/refresh and retry once. A second 401 right after a
+fresh token surfaces as a real error instead of looping forever.
+
+Verified: a full re-run (Peggy, 90 questions) completed end to end
+with no further script failures. Coverage held strong; Tim's only
+callout was 7 different follow-ups (Q19/32/33/34/43/68/85) all
+circling back to the same core fact (leaving college over her father's
+failed business) - accepted as thematically justified given how
+central that event is to her story, not a bug, and documented as
+something to keep an eye on rather than something to fix."
 ```

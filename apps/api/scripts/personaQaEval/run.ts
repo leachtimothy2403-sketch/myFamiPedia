@@ -20,7 +20,14 @@
 // are seeded directly into interview_answers with transcript already set —
 // bypassing the real endpoint's audioR2Key requirement on purpose (that's a
 // separately-tested, orthogonal concern; this eval is about question
-// quality, not transcription). Ends with a grading pass: a third Claude call
+// quality, not transcription). recordAnswerInBiography is called explicitly
+// right after that insert (docs/handover_2026-07-19-qa-persona-eval.md,
+// "sixth-order fix") — in production that only ever happens inside
+// transcribeAnswer.ts's processTranscribeJob, which this script's direct
+// insert has no reason to go through, so without this explicit call
+// interview_biography_sections stayed empty for the whole eval run and
+// generateFollowUpQuestion had zero coverage signal to work with. Ends with
+// a grading pass: a third Claude call
 // compares the full transcript against the ground-truth bio and reports
 // which buried facts got surfaced, which life areas stayed thin, and
 // whether any follow-up repeated itself — the failure mode a real bug once
@@ -36,12 +43,54 @@
 // + up to 45 follow-ups) caps how many generated follow-ups to run before
 // stopping — otherwise the loop only ends when the model itself stops (it
 // doesn't reliably self-terminate).
+//
+// Optional: a persona key, as either a CLI arg (`tsx run.ts terse`) or the
+// QA_EVAL_PERSONA env var — the CLI arg form is what package.json's scripts
+// use (`pnpm eval:qa-persona-terse`), since it works identically in
+// PowerShell, cmd, and bash with no extra dependency (no cross-env) needed;
+// the env var form is there for anyone who prefers setting it that way.
+// "peggy" (default, ./persona.ts — warm, associative, deliberately deflects
+// on sensitive topics) or "terse" (./personaTerse.ts — Walter "Bud" Okafor,
+// literal and chronological, buries facts through brevity rather than
+// deflection, never hints a topic is sensitive). Added 2026-07-19 per the
+// "known gaps" callout in docs/handover_2026-07-19-qa-persona-eval.md: one
+// persona's phrasing quirks could flatter or unfairly penalize the system
+// independent of whether the underlying adaptive-question logic is actually
+// sound — running a contrasting archetype is the check for that. Add more
+// personas the same way: a new file exporting the same four names
+// (PERSONA_NAME, PERSONA_BIO, PERSONA_ANSWER_SYSTEM_PROMPT, BURIED_FACTS),
+// registered below.
 
 import fs from "node:fs";
 import path from "node:path";
 import supertest from "supertest";
 import { createTestDb } from "../../tests/helpers/testDb";
-import { PERSONA_NAME, PERSONA_BIO, PERSONA_ANSWER_SYSTEM_PROMPT, BURIED_FACTS } from "./persona";
+import * as peggyPersona from "./persona";
+import * as tersePersona from "./personaTerse";
+
+// recordAnswerInBiography is deliberately NOT a static import up here, even
+// though every other application-code import in this file (db/pool.ts, the
+// seed module, src/index) is a dynamic import placed inside main() after
+// createTestDb() runs - see that function's own docstring in
+// tests/helpers/testDb.ts: config/env.ts reads process.env.DATABASE_URL
+// once at module-import time, and static imports are hoisted to the top of
+// the module regardless of where they're written in the file. A static
+// import here would pull in biography.service.ts -> claude.service.ts ->
+// config/env.ts BEFORE createTestDb() ever gets to point DATABASE_URL at
+// the throwaway pglite instance - which is exactly the bug that shipped
+// once (docs/handover_2026-07-19-qa-persona-eval.md, "seventh-order fix"):
+// config/env.ts silently locked onto Tim's real dev DATABASE_URL instead,
+// and the seed script's del() correctly failed against his real,
+// already-answered interview_questions rows.
+
+const PERSONAS = { peggy: peggyPersona, terse: tersePersona } as const;
+type PersonaKey = keyof typeof PERSONAS;
+
+const personaKey = (process.argv[2] ?? process.env.QA_EVAL_PERSONA ?? "peggy").toLowerCase() as PersonaKey;
+if (!(personaKey in PERSONAS)) {
+  throw new Error(`Unknown persona "${personaKey}" — expected one of: ${Object.keys(PERSONAS).join(", ")}`);
+}
+const { PERSONA_NAME, PERSONA_BIO, PERSONA_ANSWER_SYSTEM_PROMPT, BURIED_FACTS } = PERSONAS[personaKey];
 
 const MAX_FOLLOWUPS = Number(process.env.QA_EVAL_MAX_FOLLOWUPS ?? 45);
 
@@ -74,7 +123,25 @@ function sleep(ms: number) {
 // (empty content, 5xx, network errors) a few times with backoff, and logs
 // the raw response body on final failure so a *real* recurring problem is
 // actually diagnosable next time instead of a bare "no text content".
-async function callClaude(system: string | undefined, userPrompt: string, maxTokens: number): Promise<string> {
+// 2026-07-19 second fix, same day — plain retry (above the diff) wasn't
+// enough on its own. A deep real interview (question 50) hit the same "no
+// text content" failure but with stop_reason: max_tokens — the model got
+// cut off before ever emitting a text block, a deterministic failure given
+// the same token budget, not a random glitch. Retrying 3x at the same
+// budget just failed the same way 3 times. Now, when a failure is
+// specifically a max_tokens cutoff with no text produced, the next attempt
+// doubles the budget (capped at 2000) instead of just waiting and repeating
+// verbatim — a genuinely transient failure (5xx, an empty response for no
+// discernible reason) still just gets a plain backoff-and-retry. Mirrors
+// the same fix in claude.service.ts's callAnthropic (production code hit
+// this too) — kept as a separate copy here since this script is
+// intentionally standalone/dependency-light, not because the logic differs.
+// 2026-07-19 third fix, same day — a live run of this exact script (Peggy,
+// 90 questions) hit the same wall at question 65: 500 -> 1000 -> 2000 all
+// cut off with zero text, exhausting all 3 attempts. Mirrors the same fix
+// made in claude.service.ts's callAnthropic: one more attempt, cap raised to
+// 4000, so the ladder is 500 -> 1000 -> 2000 -> 4000.
+async function callClaude(system: string | undefined, userPrompt: string, initialMaxTokens: number): Promise<string> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     throw new Error(
@@ -82,8 +149,9 @@ async function callClaude(system: string | undefined, userPrompt: string, maxTok
     );
   }
 
-  const maxAttempts = 3;
+  const maxAttempts = 4;
   let lastError: Error | undefined;
+  let maxTokens = initialMaxTokens;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -104,14 +172,20 @@ async function callClaude(system: string | undefined, userPrompt: string, maxTok
       const data = JSON.parse(rawBody) as { content: { type: string; text?: string }[]; stop_reason?: string };
       const text = data.content?.find((b) => b.type === "text")?.text?.trim();
       if (!text) {
+        const hitMaxTokens = data.stop_reason === "max_tokens";
         throw new Error(
-          `Claude returned no text content (stop_reason: ${data.stop_reason ?? "unknown"}). Raw response: ${rawBody.slice(0, 500)}`
+          `Claude returned no text content (stop_reason: ${data.stop_reason ?? "unknown"})` +
+            (hitMaxTokens ? ` — cut off before any text was emitted at max_tokens=${maxTokens}` : "") +
+            `. Raw response: ${rawBody.slice(0, 500)}`
         );
       }
       return text;
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
       if (attempt < maxAttempts) {
+        if (lastError.message.includes("cut off before any text was emitted")) {
+          maxTokens = Math.min(maxTokens * 2, 4000);
+        }
         const backoffMs = attempt * 2000;
         console.warn(`  (Claude call failed on attempt ${attempt}/${maxAttempts}, retrying in ${backoffMs}ms: ${lastError.message})`);
         await sleep(backoffMs);
@@ -126,13 +200,17 @@ async function answerAsPersona(transcript: TranscriptEntry[], question: string):
     ? transcript.map((t) => `Q: ${t.question}\nYour answer: ${t.answer}`).join("\n\n")
     : "(This is the first question — no prior conversation yet.)";
   const prompt = `Here is the interview so far:\n\n${history}\n\nNew question: ${question}\n\nAnswer as yourself, following your own instructions above about tone, length, and what to share versus hold back.`;
-  return callClaude(PERSONA_ANSWER_SYSTEM_PROMPT, prompt, 300);
+  // 500 rather than 300 (this call's original budget) — same headroom bump
+  // as claude.service.ts's callAnthropic, for the same reason: a long
+  // interview's accumulated history can make an answer want more room.
+  return callClaude(PERSONA_ANSWER_SYSTEM_PROMPT, prompt, 500);
 }
 
 async function main() {
   console.log("Booting in-memory Postgres (pglite)...");
   const testDb = await createTestDb();
   const { db } = await import("../../src/db/pool");
+  const { recordAnswerInBiography } = await import("../../src/services/biography.service");
   await db.migrate.latest();
 
   // The seed file is a plain CommonJS module (exports.seed = ...) — handle
@@ -157,7 +235,8 @@ async function main() {
   if (registerRes.status !== 201) {
     throw new Error(`Register failed: ${registerRes.status} ${JSON.stringify(registerRes.body)}`);
   }
-  const accessToken = registerRes.body.accessToken as string;
+  let accessToken = registerRes.body.accessToken as string;
+  let refreshToken = registerRes.body.refreshToken as string;
   const decoded = JSON.parse(Buffer.from(accessToken.split(".")[1], "base64").toString());
   const personId = decoded.personId as string;
 
@@ -169,6 +248,33 @@ async function main() {
     throw new Error(`Creating interview session failed: ${sessionRes.status} ${JSON.stringify(sessionRes.body)}`);
   }
   const sessionId = sessionRes.body.id as string;
+
+  // 2026-07-19 fix — a real run (peggy, 77 questions in, several minutes)
+  // died with "GET /interview-questions/next failed: 401 Invalid or expired
+  // token". Access tokens expire after 15m (auth.routes.ts's issueTokens),
+  // and a long interview easily outlives that once every question's
+  // persona-answer + biography-summary + next-question Claude calls (plus
+  // any retry backoff) are counted. One refresh-and-retry on a 401 covers
+  // it; if a fresh token still 401s, something else is actually wrong and
+  // that should surface as a real failure rather than be retried forever.
+  async function fetchNextQuestion() {
+    let res = await request()
+      .get(`/api/v1/interview-questions/next?personId=${personId}`)
+      .set("Authorization", `Bearer ${accessToken}`);
+    if (res.status === 401) {
+      console.warn("  (access token expired mid-run, refreshing via /auth/refresh and retrying...)");
+      const refreshRes = await request().post("/api/v1/auth/refresh").send({ refreshToken });
+      if (refreshRes.status !== 200) {
+        throw new Error(`Token refresh failed: ${refreshRes.status} ${JSON.stringify(refreshRes.body)}`);
+      }
+      accessToken = refreshRes.body.accessToken as string;
+      refreshToken = refreshRes.body.refreshToken as string;
+      res = await request()
+        .get(`/api/v1/interview-questions/next?personId=${personId}`)
+        .set("Authorization", `Bearer ${accessToken}`);
+    }
+    return res;
+  }
 
   const transcript: TranscriptEntry[] = [];
   let curatedCount = 0;
@@ -186,11 +292,11 @@ async function main() {
       .join("\n\n");
     const outPath = path.join(
       process.cwd(),
-      `qa-persona-eval-report-${Date.now()}${incomplete ? "-INCOMPLETE" : ""}.md`
+      `qa-persona-eval-report-${personaKey}-${Date.now()}${incomplete ? "-INCOMPLETE" : ""}.md`
     );
     const fullReport = `# Adaptive Q&A persona eval report${incomplete ? " (INCOMPLETE — the run failed partway through, see below)" : ""}
 
-Persona: ${PERSONA_NAME}
+Persona: ${PERSONA_NAME} (${personaKey})
 Curated questions answered: ${curatedCount}
 Follow-up questions answered: ${followupCount}
 
@@ -211,9 +317,7 @@ ${gradingReport ?? "(not run — the interview loop failed before reaching the g
   try {
     // eslint-disable-next-line no-constant-condition
     while (true) {
-      const nextRes = await request()
-        .get(`/api/v1/interview-questions/next?personId=${personId}`)
-        .set("Authorization", `Bearer ${accessToken}`);
+      const nextRes = await fetchNextQuestion();
 
       if (nextRes.status === 204) {
         console.log("GET /interview-questions/next returned 204 (nothing left) — stopping.");
@@ -242,6 +346,24 @@ ${gradingReport ?? "(not run — the interview loop failed before reaching the g
         audio_r2_key: "eval://not-a-real-recording",
         transcript: answerText,
       });
+
+      // See the file header — this is the explicit stand-in for what
+      // processTranscribeJob does in production. Not wrapped as loosely as
+      // the try/catch around Claude retries above: a failure here should be
+      // loud, not silently leave a category's coverage signal stale for the
+      // rest of a 90-question run the way it did before this was wired in
+      // at all.
+      try {
+        await recordAnswerInBiography(db, {
+          personId,
+          personName: PERSONA_NAME,
+          lifePhase: q.life_phase,
+          question: q.text,
+          answer: answerText,
+        });
+      } catch (err) {
+        console.warn(`  (biography update failed for question ${transcript.length + 1}, continuing: ${err instanceof Error ? err.message : String(err)})`);
+      }
 
       if (isGenerated) followupCount++;
       else curatedCount++;
