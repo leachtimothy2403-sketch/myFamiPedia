@@ -3,6 +3,7 @@ import { connection } from "./queue";
 import { withServiceContext } from "../db/pool";
 import { getObjectBuffer } from "../services/r2.service";
 import { visionService as defaultVisionService, collectionIdFor, VisionService } from "../services/vision.service";
+import { ensureVisionCompatible } from "../services/imageNormalization.service";
 
 export interface DetectJobData {
   photoId: string;
@@ -40,7 +41,8 @@ export async function processDetectJob(data: DetectJobData, deps: FaceDetectionD
   const photo = await withServiceContext((trx) => trx("photos").where({ id: photoId }).first());
   if (!photo) throw new Error(`Photo ${photoId} not found`);
 
-  const imageBytes = await deps.getBytes(photo.r2_key);
+  const rawBytes = await deps.getBytes(photo.r2_key);
+  const imageBytes = await ensureVisionCompatible(rawBytes, photo.r2_key);
   const faces = await deps.vision.detectFaces(imageBytes);
 
   const faceIds = await withServiceContext(async (trx) => {

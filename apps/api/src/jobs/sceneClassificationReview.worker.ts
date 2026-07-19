@@ -3,6 +3,7 @@ import { connection } from "./queue";
 import { withServiceContext } from "../db/pool";
 import { getObjectBuffer } from "../services/r2.service";
 import { classifyPhotoScene as defaultClassifyPhotoScene, PhotoClassificationResult } from "../services/claude.service";
+import { ensureVisionCompatible } from "../services/imageNormalization.service";
 
 export interface ReviewJobData {
   photoId: string;
@@ -30,7 +31,8 @@ export async function processReviewJob(data: ReviewJobData, deps: SceneClassific
   );
   if (!classification) throw new Error(`No stage-1 classification exists yet for photo ${photoId}`);
 
-  const imageBytes = await deps.getBytes(photo.r2_key);
+  const rawBytes = await deps.getBytes(photo.r2_key);
+  const imageBytes = await ensureVisionCompatible(rawBytes, photo.r2_key);
   const labels = (classification.labels ?? []) as { label: string; confidence: number }[];
   const result = await deps.classify(imageBytes, labels);
 

@@ -7,6 +7,7 @@ import {
   SceneLabelsService,
   passesTriage,
 } from "../services/sceneLabels.service";
+import { ensureVisionCompatible } from "../services/imageNormalization.service";
 
 export interface ClassifyJobData {
   photoId: string;
@@ -30,7 +31,8 @@ export async function processClassifyJob(data: ClassifyJobData, deps: SceneClass
   const photo = await withServiceContext((trx) => trx("photos").where({ id: photoId }).first());
   if (!photo) throw new Error(`Photo ${photoId} not found`);
 
-  const imageBytes = await deps.getBytes(photo.r2_key);
+  const rawBytes = await deps.getBytes(photo.r2_key);
+  const imageBytes = await ensureVisionCompatible(rawBytes, photo.r2_key);
   const labels = await deps.labels.detectLabels(imageBytes);
   const triagePassed = passesTriage(labels);
 
