@@ -58,6 +58,26 @@ export async function createTestDb(): Promise<TestDb> {
   process.env.JWT_ACCESS_SECRET = process.env.JWT_ACCESS_SECRET ?? "test-secret";
   process.env.JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET ?? "test-refresh-secret";
 
+  // Forced empty, not defaulted with ?? — several route tests (photos.test.ts,
+  // memories.test.ts, collection.test.ts) assert the "R2 not configured"
+  // degradation path (safePresignDownload catching r2.service.ts's
+  // presignDownload throw and returning null) on the assumption this test
+  // env never has real R2 credentials. getSignedUrl is a pure local
+  // signature computation, no network call, so if real credentials happen to
+  // be sitting in the repo root .env (needed there for actual local dev
+  // against a real bucket) they leak straight into env.r2.* via
+  // config/env.ts's dotenv.config() the same way ANTHROPIC_API_KEY did
+  // (docs/handover_2026-07-19-qa-persona-eval.md) — env.r2.accountId etc.
+  // read straight from process.env once, at import time — and
+  // presignDownload quietly succeeds with a real-looking signed URL instead
+  // of throwing, which is exactly what those tests exist to catch NOT
+  // happening. Blanked unconditionally here so the "not configured" path is
+  // deterministic regardless of what's in .env, same choke point every
+  // route/worker test already boots through.
+  process.env.R2_ACCOUNT_ID = "";
+  process.env.R2_ACCESS_KEY_ID = "";
+  process.env.R2_SECRET_ACCESS_KEY = "";
+
   return {
     teardown: async () => {
       await server.stop();
