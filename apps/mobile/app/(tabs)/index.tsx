@@ -48,6 +48,8 @@ export default function HomeScreen() {
         <Button title="Manage" onPress={() => router.push("/collection/manage")} />
       </View>
       <Button title="Review proposed memories" onPress={() => router.push("/collection/review")} />
+      <Button title="Add a photo" onPress={() => router.push("/collection/add-photo")} />
+      <Button title="Sync camera roll" onPress={() => router.push("/collection/camera-roll-sync")} />
       {sessionLoading || feedLoading ? (
         <ActivityIndicator />
       ) : (

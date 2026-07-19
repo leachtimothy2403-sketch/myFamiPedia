@@ -248,4 +248,18 @@ export class ApiClient {
   async completeUpload(uploadId: string) {
     return this.request(`/uploads/${uploadId}/complete`, { method: "POST" });
   }
+
+  // --- Camera-roll sync (the "proactive" path, docs/media_pipeline.md) ---
+  // Batch registration only — each photo's bytes must already be PUT to R2
+  // via a presignUpload({ context: "photo" }) URL before its r2Key is passed
+  // here. Unlike completeUpload, this always runs the full detection +
+  // scene-classification + embedding pipeline and one family-wide clustering
+  // pass per call, since (unlike the pull path) nothing yet knows which of
+  // these photos are worth surfacing as a memory.
+  async syncCameraRoll(photos: { r2Key: string; takenAt?: string; location?: { lat: number; lng: number } }[]) {
+    return this.request<{ items: { id: string }[] }>("/collection/camera-roll/sync", {
+      method: "POST",
+      body: { photos },
+    });
+  }
 }

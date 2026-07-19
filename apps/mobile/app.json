@@ -14,6 +14,19 @@
         {
           "microphonePermission": "Allow myFamiPedia to access your microphone to record interview answers."
         }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow myFamiPedia to access your photos so you can add them to family memories."
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow myFamiPedia to scan your photo library for new photos that might be family memories.",
+          "isAccessMediaLocationEnabled": true
+        }
       ]
     ],
     "ios": {
