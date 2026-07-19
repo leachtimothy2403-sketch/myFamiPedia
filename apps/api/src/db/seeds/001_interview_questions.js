@@ -1,26 +1,19 @@
-// Starter set from docs/voice_pipeline.md's "50-100 curated life-story questions" —
-// this is a representative sample across all seven life phases, not the full bank.
-// Question quality is called out in the product doc as the most important investment
-// in Section 3 — expand this list deliberately, don't just pad it.
+// Fresh dev/test bootstrap only — del()+insert() from scratch, so this is
+// NOT safe to rerun once real interview_answers exist against these rows
+// (interview_answers.question_id has no ON DELETE CASCADE; Postgres will
+// reject the delete rather than corrupt anything, but that also means this
+// script simply can't repopulate an already-used real database). For that
+// path, see migrations/023_expand_curated_question_bank.js, which adds the
+// same expanded set additively without touching the original rows.
+//
+// Question data itself lives in ../curatedQuestions.js, shared with that
+// migration so the two can't drift apart. See that file's header for the
+// full rationale behind the 15 -> 45 expansion.
+const { ORIGINAL_FIFTEEN, EXPANSION } = require("../curatedQuestions");
+
 exports.seed = async function (knex) {
   await knex("interview_questions").del();
-  const rows = [
-    ["childhood", "What is your earliest memory?"],
-    ["childhood", "What did your street or neighborhood look like growing up?"],
-    ["childhood", "Who was your best friend as a child, and what did you do together?"],
-    ["education", "What was your favorite subject in school, and why?"],
-    ["education", "Did you have a teacher who changed how you saw the world?"],
-    ["work", "What was your first job, and what did it teach you?"],
-    ["work", "What work are you most proud of?"],
-    ["relationships", "How did you meet your spouse or partner?"],
-    ["relationships", "What's a piece of advice about love you'd want your grandchildren to have?"],
-    ["family", "What's a family tradition you hope continues after you?"],
-    ["family", "What was it like when your first child was born?"],
-    ["values", "What belief has guided you most through hard times?"],
-    ["values", "What does a good life mean to you?"],
-    ["legacy", "What do you hope people remember about you?"],
-    ["legacy", "If you could tell your younger self one thing, what would it be?"],
-  ];
+  const rows = [...ORIGINAL_FIFTEEN, ...EXPANSION];
   await knex("interview_questions").insert(
     rows.map(([life_phase, text], i) => ({ life_phase, text, sort_order: i + 1 }))
   );
