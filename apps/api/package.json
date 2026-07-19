@@ -13,7 +13,8 @@
     "lint": "eslint src --ext .ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "workers": "tsx watch src/jobs/runWorkers.ts"
+    "workers": "tsx watch src/jobs/runWorkers.ts",
+    "eval:qa-persona": "tsx scripts/personaQaEval/run.ts"
   },
   "dependencies": {
     "@aws-sdk/client-rekognition": "^3.700.0",
