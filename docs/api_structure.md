@@ -12,8 +12,8 @@ REST API, Node.js/Express. Auth via JWT access token + refresh token (Redis-back
 | POST | `/auth/magic-link/verify` | Exchanges the link's token for access + refresh token |
 | POST | `/auth/refresh` | Rotates refresh token |
 | POST | `/auth/logout` | Revokes session in Redis |
-| POST | `/persons/:id/administrator/nominate` | Person nominates their own administrator |
-| POST | `/persons/:id/administrator/confirm` | Fallback path: closest connected member confirms |
+| GET | `/family/administrator` | Current family-group administrator (`persons.family_role = 'administrator'`) |
+| POST | `/family/administrator/transfer` | Direct transfer by the current administrator to another active family member — `docs/family_administrator_and_privacy_model.md` section 1 |
 
 ## Family tree (Section 1)
 
@@ -42,7 +42,7 @@ REST API, Node.js/Express. Auth via JWT access token + refresh token (Redis-back
 | POST | `/collection/proposed/:id/accept` | Two-tap add to tree |
 | POST | `/collection/proposed/:id/reject` | Discard proposal |
 | GET/PATCH | `/persons/:id/privacy-tier` | Get/set tier 1–3 (self only, never admin-writable) |
-| GET/PATCH | `/persons/:id/question-frequency` | never/few-days/weekly/daily |
+| GET/PATCH | `/persons/:id/question-frequency` | never/few_days/weekly/daily |
 | GET | `/persons/:id/question-prompt` | Next adaptive question-stream prompt |
 | POST | `/question-prompt/:id/answer` | Voice or text answer, feeds `memories` |
 
