@@ -4,6 +4,21 @@ import { mockQueues, getQueueMock } from "../helpers/queueMock";
 
 mockQueues();
 
+// POST /question-prompt/:id/answer's text path calls recordAnswerInBiography
+// directly (biography.service.ts) — a real Anthropic call several layers
+// down (claude.service.ts's callAnthropic) if left unmocked, same gotcha
+// interviews.test.ts already documents for its own module-level claude.service.ts
+// mock. Mocked at the biography.service.ts layer here instead, since that's
+// what collection.routes.ts actually imports directly — narrower than
+// mocking claude.service.ts itself, and this file never exercises the
+// interview routes that import getBiographySections, so a bare stub for
+// every export is enough.
+vi.mock("../../src/services/biography.service", () => ({
+  recordAnswerInBiography: vi.fn(async () => {}),
+  recordMemoryInBiography: vi.fn(async () => {}),
+  getBiographySections: vi.fn(async () => []),
+}));
+
 describe("collection", () => {
   const ctx = withApp();
   let user: TestUser;
@@ -416,6 +431,112 @@ describe("collection", () => {
         .set("Authorization", `Bearer ${user.accessToken}`);
       expect(res.status).toBe(200);
       expect(res.body.question).toBeNull();
+    });
+
+    // 2026-07-20 — POST /question-prompt/:id/answer, previously a stub
+    // (docs/section2_pipeline.md section 4). Reuses interview_answers/
+    // interview_sessions as the same "already answered" source of truth the
+    // GET endpoint above reads, via migration 027 (audio_r2_key made
+    // nullable so a text-only answer can still get a row).
+    describe("POST /question-prompt/:id/answer", () => {
+      async function seedQuestion(overrides: Partial<Record<string, unknown>> = {}) {
+        const [q] = await ctx
+          .knex()("interview_questions")
+          .insert({ text: "What was your first job?", life_phase: "work", sort_order: 1, ...overrides })
+          .returning("*");
+        return q;
+      }
+
+      it("requires audioR2Key or content", async () => {
+        const q = await seedQuestion();
+        const res = await ctx
+          .request()
+          .post(`/api/v1/question-prompt/${q.id}/answer`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({});
+        expect(res.status).toBe(400);
+      });
+
+      it("404s for an unknown question id", async () => {
+        const res = await ctx
+          .request()
+          .post(`/api/v1/question-prompt/00000000-0000-0000-0000-000000000000/answer`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ content: "Something" });
+        expect(res.status).toBe(404);
+      });
+
+      it("a text answer creates an interview_answers row, a memory, and updates the biography, without touching Q_TRANS", async () => {
+        getQueueMock("transcriptionQueue").add.mockClear();
+        const { recordAnswerInBiography } = await import("../../src/services/biography.service");
+        const q = await seedQuestion({ text: "What was your first job?", life_phase: "work" });
+
+        const res = await ctx
+          .request()
+          .post(`/api/v1/question-prompt/${q.id}/answer`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ content: "I worked at a diner downtown." });
+
+        expect(res.status).toBe(201);
+        expect(res.body.memoryId).toBeDefined();
+        expect(res.body.transcript).toBe("I worked at a diner downtown.");
+
+        const knex = ctx.knex();
+        const answerRow = await knex("interview_answers").where({ id: res.body.id }).first();
+        expect(answerRow.audio_r2_key).toBeNull();
+        expect(answerRow.memory_id).toBe(res.body.memoryId);
+
+        const memory = await knex("memories").where({ id: res.body.memoryId }).first();
+        expect(memory.content).toBe("I worked at a diner downtown.");
+        expect(memory.provenance_type).toBe("text");
+        expect(memory.provenance_label).toBe("What was your first job?");
+        expect(memory.contributor_id).toBe(user.personId);
+
+        const tags = await knex("memory_persons").where({ memory_id: res.body.memoryId });
+        expect(tags.map((t: { person_id: string }) => t.person_id)).toEqual([user.personId]);
+
+        expect(recordAnswerInBiography as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({
+            personId: user.personId,
+            lifePhase: "work",
+            question: "What was your first job?",
+            answer: "I worked at a diner downtown.",
+          })
+        );
+
+        expect(getQueueMock("embeddingQueue").add).toHaveBeenCalledWith("embed-memory", { memoryId: res.body.memoryId });
+        expect(getQueueMock("transcriptionQueue").add).not.toHaveBeenCalled();
+
+        // The whole point: GET /persons/:id/question-prompt shouldn't offer
+        // this question again now that it's been answered.
+        const nextRes = await ctx
+          .request()
+          .get(`/api/v1/persons/${user.personId}/question-prompt`)
+          .set("Authorization", `Bearer ${user.accessToken}`);
+        expect(nextRes.body.question).toBeNull();
+      });
+
+      it("a voice answer creates an untranscribed interview_answers row and falls back to Q_TRANS (no transcription creds configured in tests)", async () => {
+        getQueueMock("transcriptionQueue").add.mockClear();
+        const q = await seedQuestion();
+
+        const res = await ctx
+          .request()
+          .post(`/api/v1/question-prompt/${q.id}/answer`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ audioR2Key: "voice/x.m4a" });
+
+        expect(res.status).toBe(201);
+        expect(res.body.audio_r2_key).toBe("voice/x.m4a");
+        expect(res.body.transcript).toBeNull();
+
+        const knex = ctx.knex();
+        const session = await knex("interview_sessions").where({ id: res.body.session_id }).first();
+        expect(session.status).toBe("completed");
+
+        expect(getQueueMock("transcriptionQueue").add).toHaveBeenCalledWith("transcribe", { interviewAnswerId: res.body.id });
+      });
     });
   });
 });

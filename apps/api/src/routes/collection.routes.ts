@@ -1,13 +1,14 @@
 import { Router } from "express";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { withRlsContext } from "../db/pool";
-import { faceDetectionQueue, embeddingQueue, sceneClassificationQueue, photoClusteringQueue } from "../jobs/queue";
+import { faceDetectionQueue, embeddingQueue, sceneClassificationQueue, photoClusteringQueue, transcriptionQueue } from "../jobs/queue";
 import { HttpError } from "../utils/httpError";
-import { notImplemented } from "../utils/notImplemented";
 import { presignDownload } from "../services/r2.service";
+import { processTranscribeJob } from "../jobs/transcribeAnswer";
+import { recordAnswerInBiography } from "../services/biography.service";
+import { env } from "../config/env";
 
 export const collectionRouter = Router();
-const spec = "docs/section2_pipeline.md";
 
 // Device-side scan trigger pushes new photo hashes/metadata. This route's
 // job stops at registering the photos and queuing them for downstream
@@ -365,4 +366,134 @@ collectionRouter.get("/persons/:id/question-prompt", requireAuth, async (req: Au
   }
 });
 
-collectionRouter.post("/question-prompt/:id/answer", requireAuth, notImplemented(spec));
+// 2026-07-20 — closes docs/section2_pipeline.md section 4's last unbuilt
+// piece. GET /persons/:id/question-prompt above already draws from the same
+// interview_questions bank the full adaptive interview (interviews.routes.ts)
+// uses, and its own "already answered" check already reads interview_answers
+// via interview_sessions — so answering here reuses that exact same
+// pipeline (a lightweight, immediately-completed, self-facilitated session)
+// rather than inventing a second, parallel way to mark a curated question
+// answered. Getting that wrong would silently reintroduce the exact
+// repeated-question failure mode a good chunk of this session's other work
+// (docs/handover_2026-07-19-qa-persona-eval.md) went into fixing — a
+// nudge-answered question would keep being offered again by this same
+// endpoint, or worse, by a full interview session later, since neither would
+// ever see it as answered.
+//
+// Accepts EITHER audioR2Key (voice — the exact same synchronous-transcribe-
+// then-fallback-to-Q_TRANS pattern POST /interview-sessions/:id/answers and
+// /complete already use, just combined into one call since there's no
+// separate "session" for a caller to later explicitly complete) OR content
+// (text — has no transcription step, so the resulting memory and biography
+// update happen synchronously, right here, and Q_TRANS is never touched at
+// all) — matching section2_pipeline.md's "voice answers go through Q_TRANS;
+// both land in memories with provenance_type set accordingly." Migration 027
+// made interview_answers.audio_r2_key nullable specifically for the text
+// case — deliberately NOT writing text answers straight into `memories` with
+// no interview_answers row at all, even though that would be simpler, since
+// that would break the one thing GET /persons/:id/question-prompt actually
+// depends on to know a question's been answered.
+collectionRouter.post("/question-prompt/:id/answer", requireAuth, async (req: AuthedRequest, res, next) => {
+  try {
+    const { personId, familyGroupId } = req.auth!;
+    const { audioR2Key, content } = req.body ?? {};
+    if (!audioR2Key && !content) {
+      return res.status(400).json({ error: "audioR2Key or content is required" });
+    }
+
+    const { answer, question, person } = await withRlsContext({ personId, familyGroupId }, async (trx) => {
+      const question = await trx("interview_questions").where({ id: req.params.id }).first();
+      if (!question) throw new HttpError(404, "Question not found");
+      const person = await trx("persons").where({ id: personId }).first();
+      if (!person) throw new HttpError(404, "Person not found");
+
+      // Self-directed by nature (a push-notification nudge answered by the
+      // person it's about) — person_id and facilitator_person_id are both
+      // the caller, same convention POST /interview-sessions uses when its
+      // optional personId is omitted. Completed immediately: this endpoint
+      // represents one whole, self-contained answer, not an ongoing
+      // multi-question session a client will separately open and close.
+      const [session] = await trx("interview_sessions")
+        .insert({ person_id: personId, facilitator_person_id: personId, status: "in_progress" })
+        .returning("*");
+
+      const [answer] = await trx("interview_answers")
+        .insert({
+          session_id: session.id,
+          question_id: question.id,
+          audio_r2_key: audioR2Key ?? null,
+          transcript: content ?? null,
+        })
+        .returning("*");
+
+      await trx("interview_sessions").where({ id: session.id }).update({ status: "completed", completed_at: new Date() });
+
+      return { answer, question, person };
+    });
+
+    if (content) {
+      const memoryId: string = await withRlsContext({ personId, familyGroupId }, async (trx) => {
+        const [memory] = await trx("memories")
+          .insert({
+            family_group_id: familyGroupId,
+            contributor_id: personId,
+            content,
+            provenance_type: "text",
+            provenance_label: question.text,
+          })
+          .returning("id");
+        await trx("memory_persons").insert({ memory_id: memory.id, person_id: personId });
+        await trx("interview_answers").where({ id: answer.id }).update({ memory_id: memory.id });
+        return memory.id;
+      });
+
+      // Non-fatal, same principle as every other biography-update call site
+      // added this session — a Claude hiccup here shouldn't undo an answer
+      // and memory that already saved successfully above. Known life_phase
+      // straight from the question row, so this goes directly to
+      // recordAnswerInBiography rather than through the classify-first path
+      // memoryBiography.worker.ts uses for freeform, uncategorized memories.
+      try {
+        await withRlsContext({ personId, familyGroupId }, (trx) =>
+          recordAnswerInBiography(trx, {
+            personId,
+            personName: person.name,
+            lifePhase: question.life_phase,
+            question: question.text,
+            answer: content,
+          })
+        );
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`[collection] biography update failed for question-prompt answer ${answer.id}:`, err);
+      }
+
+      await embeddingQueue.add("embed-memory", { memoryId });
+      return res.status(201).json({ ...answer, memoryId });
+    }
+
+    // Voice path — try synchronously first (same reasoning as
+    // POST /interview-sessions/:id/answers: this session is completing in
+    // this same request, so there's no later /complete call to fall back on
+    // the way an in-progress multi-question session has); if that's not
+    // configured or fails, fall back to the real Q_TRANS queue rather than
+    // leaving the answer stuck untranscribed with nothing ever picking it
+    // back up.
+    let transcribed = false;
+    if (env.elevenlabsApiKey && env.r2.accountId) {
+      try {
+        await processTranscribeJob({ interviewAnswerId: answer.id });
+        transcribed = true;
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`[collection] synchronous transcription failed for question-prompt answer ${answer.id}:`, err);
+      }
+    }
+    if (!transcribed) {
+      await transcriptionQueue.add("transcribe", { interviewAnswerId: answer.id });
+    }
+    res.status(201).json(answer);
+  } catch (err) {
+    next(err);
+  }
+});
