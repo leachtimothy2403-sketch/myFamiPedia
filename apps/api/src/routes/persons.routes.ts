@@ -30,8 +30,32 @@ function belongsToProfile(qb: import("knex").Knex.QueryBuilder, trx: import("kne
   });
 }
 
-personsRouter.post("/persons/:id/administrator/nominate", requireAuth, notImplemented("docs/api_structure.md#auth--session"));
-personsRouter.post("/persons/:id/administrator/confirm", requireAuth, notImplemented("docs/api_structure.md#auth--session"));
+// 2026-07-20 — removed two long-standing notImplemented() stubs that lived
+// here: POST /persons/:id/administrator/nominate and .../confirm, both
+// pointing at docs/api_structure.md#auth--session as their spec. That
+// original doc described a backup/successor administrator nomination with a
+// confirm handshake ("Person nominates their own administrator" / "Fallback
+// path: closest connected member confirms"). The later, more detailed design
+// doc for this feature — docs/family_administrator_and_privacy_model.md,
+// reconstructed 2026-07-18 from the original product-design conversation —
+// explicitly parked exactly this: section 1's own wording is "Transfer/
+// succession (e.g. a backup administrator for redundancy) was discussed and
+// explicitly parked — not in scope for the initial build." So implementing
+// these two stubs now would mean building a feature the actual design
+// decision deferred, not catching up on missed scope.
+//
+// What that same design doc DOES call for — "[the role is] transferable by
+// the current one" — is already built and tested, further down in this
+// file: GET /family/administrator (read the current admin) and POST
+// /family/administrator/transfer (direct, unilateral transfer by the current
+// administrator to another active member of the same family group, no
+// nomination or recipient confirmation step), plus the three gated actions
+// from section 2 and the exactly-one-administrator-per-group DB constraint.
+// See tests/routes/administrator.test.ts (11 tests). docs/api_structure.md's
+// two rows for these stubs have been updated to reflect what's actually
+// built instead. If backup/successor nomination ever comes off the parked
+// list, it's a new, separate feature to design and build then — not a gap
+// to quietly fill in now with whatever shape happens to compile.
 
 // GET /family-groups/:id/tree — worked example showing the withRlsContext pattern
 // every other handler in this file should follow once implemented.
