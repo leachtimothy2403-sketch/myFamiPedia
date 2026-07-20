@@ -23,6 +23,14 @@ interface ClusterablePhoto {
 // confidently here") — starting values only, expect to revisit.
 const TIME_WINDOW_HOURS = 6;
 const DISTANCE_THRESHOLD_KM = 2;
+// 2026-07-20 fix — see processClusterJob's own comment on the query change
+// this bounds. Deliberately much wider than TIME_WINDOW_HOURS: a real chain
+// can transitively span longer than any one hop's window (a multi-day trip,
+// say), and bounding too tightly here would silently reintroduce the
+// split-cluster bug the "extend-or-create" rewrite below exists to prevent.
+// Wide enough to comfortably cover any realistic single outing/trip on each
+// side of a sync's own date range, tight enough to actually bound cost.
+const CLUSTER_LOOKBACK_PAD_DAYS = 7;
 
 function haversineKm(a: { lat: number; lng: number }, b: { lat: number; lng: number }): number {
   const R = 6371;
@@ -110,7 +118,24 @@ export async function processClusterJob(data: ClusterJobData) {
   // excluding permanently: a photo whose individual proposal was already
   // accepted or rejected shouldn't keep blocking it from ever joining a
   // cluster with unrelated later photos.
-  const candidates = await withServiceContext((trx) =>
+  //
+  // 2026-07-20 fix — this used to be one query fetching EVERY taken_at-having,
+  // non-pending-individually-proposed photo in the family, already-clustered
+  // or not (media_pipeline.md section 6's "known remaining cost" callout:
+  // "every clustering pass now re-fetches every taken_at-having... photo in
+  // the family, not just unclustered ones, so the query grows with the
+  // family's total library size over time rather than staying bounded to
+  // the backlog"). Fine at beta scale, a real problem once a family's synced
+  // their whole multi-year archive — this job runs after every camera-roll
+  // sync batch, so that unbounded scan repeats often, not just once.
+  //
+  // Split into two queries instead. First, the genuinely new (unclustered)
+  // candidates — naturally bounded to whatever this sync's backlog actually
+  // is, regardless of how large the family's total library has grown. If
+  // there's nothing new, there's nothing to (re-)cluster at all — skip the
+  // second query entirely rather than paying for it on a no-op trigger
+  // (e.g. face detection landing on a photo that's already fully clustered).
+  const newCandidates: Omit<ClusterablePhoto, "existing_cluster_id">[] = await withServiceContext((trx) =>
     trx("photos as p")
       .leftJoin("photo_cluster_photos as pcp", "pcp.photo_id", "p.id")
       .leftJoin("proposed_memories as pm", function () {
@@ -119,10 +144,45 @@ export async function processClusterJob(data: ClusterJobData) {
       .where("p.family_group_id", familyGroupId)
       .whereNull("pm.photo_id")
       .whereNotNull("p.taken_at")
+      .whereNull("pcp.cluster_id")
+      .select("p.id", "p.taken_at", "p.location", "p.uploaded_by", "p.face_count")
+  );
+
+  if (newCandidates.length === 0) {
+    return { familyGroupId, clustersCreated: 0, clusterIds: [] as string[], clustersExtended: [] as string[] };
+  }
+
+  // Second, already-clustered photos too (needed for the extend-vs-create
+  // logic below), but only within a padded window around the NEW candidates'
+  // own taken_at range — see CLUSTER_LOOKBACK_PAD_DAYS above for why the pad
+  // is wider than TIME_WINDOW_HOURS. Bounds cost to roughly this sync's date
+  // range instead of the whole archive, while still correctly finding an
+  // old cluster to extend when photos from an old album get synced/uploaded
+  // together (their own taken_at range drives the window, not wall-clock
+  // "now" — a decades-old batch still windows correctly around itself).
+  const takenAtMs = newCandidates.map((p) => p.taken_at.getTime());
+  const padMs = CLUSTER_LOOKBACK_PAD_DAYS * 24 * 60 * 60 * 1000;
+  const windowStart = new Date(Math.min(...takenAtMs) - padMs);
+  const windowEnd = new Date(Math.max(...takenAtMs) + padMs);
+
+  const existingClusteredNearby = await withServiceContext((trx) =>
+    trx("photos as p")
+      .join("photo_cluster_photos as pcp", "pcp.photo_id", "p.id")
+      .leftJoin("proposed_memories as pm", function () {
+        this.on("pm.photo_id", "=", "p.id").andOnVal("pm.status", "=", "pending");
+      })
+      .where("p.family_group_id", familyGroupId)
+      .whereNull("pm.photo_id")
+      .whereBetween("p.taken_at", [windowStart, windowEnd])
       .select("p.id", "p.taken_at", "p.location", "p.uploaded_by", "p.face_count", "pcp.cluster_id as existing_cluster_id")
   );
 
-  const groups = groupPhotos(candidates as ClusterablePhoto[]);
+  const candidates: ClusterablePhoto[] = [
+    ...newCandidates.map((p) => ({ ...p, existing_cluster_id: null })),
+    ...existingClusteredNearby,
+  ];
+
+  const groups = groupPhotos(candidates);
   const clusterIds: string[] = [];
   const extendedClusterIds: string[] = [];
 

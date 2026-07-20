@@ -343,5 +343,71 @@ describe("photo-clustering worker", () => {
       );
       expect(clusteredPhotoIds.sort()).toEqual(allPhotoIds.sort());
     });
+
+    // 2026-07-20 fix — the "already-clustered" query used to fetch the
+    // family's ENTIRE taken_at-having history every pass (media_pipeline.md
+    // section 6's "known remaining cost"), now bounded to a window padded
+    // around the NEW candidates' own taken_at range (CLUSTER_LOOKBACK_PAD_DAYS).
+    // The important part to get right: that window has to be anchored to the
+    // candidates' own dates, not wall-clock "now" — otherwise syncing an old
+    // family photo album (all genuinely old taken_at values) would never
+    // find its own old cluster to extend, silently reintroducing the
+    // split-cluster bug the surrounding "extend-or-create" rewrite exists to
+    // prevent. This test's photos are all dated years in the past relative
+    // to whenever the suite actually runs.
+    it("extends an old cluster when new old-dated photos are synced together, regardless of how long ago that was relative to now", async () => {
+      const { processClusterJob } = await import("../../src/jobs/photoClustering.worker");
+      const { group, uploaderA } = await seedFamily();
+      const base = new Date("2019-03-10T10:00:00.000Z").getTime(); // years before this suite runs
+
+      const p1 = await insertPhoto(group.id, uploaderA.id, { takenAt: new Date(base).toISOString() });
+      const p2 = await insertPhoto(group.id, uploaderA.id, { takenAt: new Date(base + 60 * 60 * 1000).toISOString() });
+
+      const first = await processClusterJob({ familyGroupId: group.id });
+      expect(first.clustersCreated).toBe(1);
+      const existingClusterId = first.clusterIds[0];
+
+      // A third old photo from the same 2019 album gets synced later (e.g.
+      // scanned/uploaded separately from the first two).
+      const p3 = await insertPhoto(group.id, uploaderA.id, { takenAt: new Date(base + 2 * 60 * 60 * 1000).toISOString() });
+
+      const second = await processClusterJob({ familyGroupId: group.id });
+      expect(second.clustersExtended).toEqual([existingClusterId]);
+
+      const knex = ctx.knex();
+      const members = await knex("photo_cluster_photos").where({ cluster_id: existingClusterId });
+      expect(members.map((m: { photo_id: string }) => m.photo_id).sort()).toEqual([p1.id, p2.id, p3.id].sort());
+    });
+
+    // Same idea from the other direction: a genuinely unrelated cluster that
+    // happens to sit outside the lookback pad shouldn't get pulled into the
+    // query at all — verified indirectly here (correctness, not query
+    // introspection) by confirming a distant cluster is left completely
+    // untouched (member count/ids unchanged) while an unrelated nearby chain
+    // still clusters normally in the same run.
+    it("leaves a cluster far outside the lookback window untouched by an unrelated nearby run", async () => {
+      const { processClusterJob } = await import("../../src/jobs/photoClustering.worker");
+      const { group, uploaderA } = await seedFamily();
+      const oldBase = new Date("2015-01-01T10:00:00.000Z").getTime();
+      const oldP1 = await insertPhoto(group.id, uploaderA.id, { takenAt: new Date(oldBase).toISOString() });
+      const oldP2 = await insertPhoto(group.id, uploaderA.id, { takenAt: new Date(oldBase + 60 * 60 * 1000).toISOString() });
+      const old = await processClusterJob({ familyGroupId: group.id });
+      expect(old.clustersCreated).toBe(1);
+      const oldClusterId = old.clusterIds[0];
+
+      // Unrelated new photos, ~4 years later — nowhere near the old
+      // cluster's date range even with the lookback pad.
+      const recentBase = new Date("2026-07-01T10:00:00.000Z").getTime();
+      await insertPhoto(group.id, uploaderA.id, { takenAt: new Date(recentBase).toISOString() });
+      await insertPhoto(group.id, uploaderA.id, { takenAt: new Date(recentBase + 60 * 60 * 1000).toISOString() });
+
+      const recent = await processClusterJob({ familyGroupId: group.id });
+      expect(recent.clustersCreated).toBe(1);
+      expect(recent.clustersExtended).toEqual([]);
+
+      const knex = ctx.knex();
+      const oldMembers = await knex("photo_cluster_photos").where({ cluster_id: oldClusterId });
+      expect(oldMembers.map((m: { photo_id: string }) => m.photo_id).sort()).toEqual([oldP1.id, oldP2.id].sort());
+    });
   });
 });
