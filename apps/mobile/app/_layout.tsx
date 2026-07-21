@@ -65,7 +65,12 @@ export default function RootLayout() {
             <Stack.Screen name="voice/[personId]/settings" options={{ title: "Voice settings" }} />
             <Stack.Screen name="voice/[personId]/consent" options={{ title: "Voice consent" }} />
             {/* interview/new and interview/[personId]/new are gone — that
-                three-screen hop is now one screen, (tabs)/share-story.tsx. */}
+                three-screen hop is now one screen, share/tell-your-story.tsx
+                (2026-07-21 — moved out of (tabs)/share-story.tsx, which is
+                now the flat Share hub). share/compose.tsx sets its own
+                dynamic title inline like person/[id]/index.tsx does, so only
+                tell-your-story needs a static title here. */}
+            <Stack.Screen name="share/tell-your-story" options={{ title: "Tell your story" }} />
             <Stack.Screen name="interview/session/[sessionId]" options={{ title: "Interview" }} />
             <Stack.Screen name="collection/review" options={{ title: "Review memories" }} />
             <Stack.Screen name="collection/manage" options={{ title: "Manage collection" }} />
@@ -80,6 +85,13 @@ export default function RootLayout() {
             <Stack.Screen name="notifications/settings" options={{ title: "Notification preferences" }} />
             <Stack.Screen name="invite/[token]" options={{ title: "Invitation" }} />
             <Stack.Screen name="family-member/new" options={{ title: "Add family member" }} />
+            {/* family/administrator.tsx sets its own title inline (matches
+                the person/[id]/index.tsx / share/compose.tsx convention) —
+                listed here only so this comment block stays the one place
+                that documents every route under app/, not because it needs
+                an options override. 2026-07-22: GET /family/administrator +
+                POST /family/administrator/transfer were API-only until now. */}
+            <Stack.Screen name="family/administrator" />
           </Stack>
         </QueryClientProvider>
       </SafeAreaProvider>

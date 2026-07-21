@@ -12,7 +12,7 @@ app/
   (tabs)/
     _layout.tsx                        # bottom tab bar (4 tabs)
     index.tsx                          # Home: memory feed (section 9)
-    tree.tsx                           # family tree, top segmented control: Structure / By person / By decade
+    tree.tsx                           # family tree structure/graph canvas only (By person / By decade removed 2026-07-20)
     share-story.tsx                    # entry point into life-story sessions (section 3), renamed from "record"
     account.tsx                        # own profile + settings hub
   person/
@@ -47,9 +47,9 @@ app/
 - `invite/[token]` sits outside both `(auth)` and `(tabs)` groups since it must work whether or not the opener already has an account — it's the one screen reachable pre-login via universal link (`https://app.myfamipedia.com/invite/:token`) or custom scheme (`myfamipedia://invite/:token`).
 - Consent flow (`voice/[personId]/consent`), interview session, and collection review are presented as modals (`Stack.Screen options={{ presentation: 'modal' }}`) rather than tab screens — each is a focused, interruption-worthy task, consistent with "20 minutes max" interview sessions and "under two minutes" review cards.
 
-## Tree tab (Structure / By person / By decade)
+## Tree tab (structure only)
 
-Explore is no longer a separate tab — `tree.tsx` now carries a segmented control at the top with three modes: **Structure** (the pan/zoom graph canvas, unchanged), **By person** (a searchable flat list, doubling as quick-jump on trees too large to scan visually), **By decade** (the card grid, including the featured "the 1960s in our family" card). Fewer tabs, same functionality. The one thing to watch: the doc calls the decade view a differentiator, and it now sits one tap deeper than before — the featured decade card on the Home feed (see the mockup) is what keeps that discoverable without its own tab.
+`tree.tsx` is the family-tree structure/graph canvas (`TreeCanvas`, pan/zoom) and nothing else as of 2026-07-20 — the **By person** (searchable flat list) and **By decade** (birth-decade grouped list) modes that used to sit alongside it via a segmented control were removed at Tim's request; too many overlapping ways to browse the same tree data. Person lookup now lives in Search. `lib/treeGrouping.ts`'s `groupByDecade`/`groupByGeneration` helpers were left in place (unused) rather than deleted, in case a future feature wants them.
 
 ## Share your story (renamed from Record a conversation)
 

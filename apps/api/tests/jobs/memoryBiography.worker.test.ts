@@ -48,6 +48,7 @@ describe("memory-biography worker", () => {
       personName: contributor.name,
       lifePhase: "childhood",
       content: memory.content,
+      memoryId: memory.id,
     });
     expect(result).toMatchObject({ memoryId: memory.id, lifePhase: "childhood", filedUnder: [contributor.id] });
   });
@@ -76,6 +77,7 @@ describe("memory-biography worker", () => {
       personName: "Grandma",
       lifePhase: "community_faith",
       content: memory.content,
+      memoryId: memory.id,
     });
     expect(result.filedUnder).toEqual([grandma.id]);
   });

@@ -15,6 +15,7 @@ export default function AccountScreen() {
     <View style={{ flex: 1, padding: 16, gap: 12 }}>
       <Text style={{ fontSize: 20, fontWeight: "600" }}>Account</Text>
       <Button title="Manage your memories" onPress={() => router.push("/collection/manage")} />
+      <Button title="Family administrator" onPress={() => router.push("/family/administrator")} />
       <Button title="Collection settings" onPress={() => router.push("/collection/settings")} />
       <Button
         title="Voice settings"

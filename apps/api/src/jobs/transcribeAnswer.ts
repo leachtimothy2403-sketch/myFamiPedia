@@ -14,6 +14,7 @@ import { withServiceContext } from "../db/pool";
 import { getObjectBuffer } from "../services/r2.service";
 import { transcriptionService as defaultTranscriptionService, TranscriptionService } from "../services/transcription.service";
 import { recordAnswerInBiography } from "../services/biography.service";
+import { maybeOfferClarification, OfferClarificationParams } from "../services/clarification.service";
 
 export { connection };
 
@@ -27,6 +28,7 @@ export interface RecordBiographyParams {
   lifePhase: string;
   question: string;
   answer: string;
+  memoryId: string;
 }
 
 export interface TranscriptionDeps {
@@ -38,23 +40,37 @@ export interface TranscriptionDeps {
   // especially since a real ANTHROPIC_API_KEY is often present in a local
   // .env even when a given test has nothing to do with Claude.
   recordBiography: (params: RecordBiographyParams) => Promise<void>;
+  // 2026-07-21/22 — optional (not every existing caller/test needs to know
+  // about this), defaults to the real clarification.service.ts call below.
+  // Same offline-double reasoning as recordBiography: a second real Claude
+  // call this function now makes per answer.
+  offerClarification?: (params: OfferClarificationParams) => Promise<string | null>;
 }
 
 const defaultDeps: TranscriptionDeps = {
   transcription: defaultTranscriptionService,
   getBytes: getObjectBuffer,
   recordBiography: (params) => withServiceContext((trx) => recordAnswerInBiography(trx, params)),
+  offerClarification: (params) => withServiceContext((trx) => maybeOfferClarification(trx, params)),
 };
 
-// docs/voice_pipeline.md section 1, and the comment on interview_answer_photos
-// (migration 008): "the transcription worker copies these into memory_photos
-// once the memory is created." Contributor is the interview SUBJECT
+// The shared tail end of "an answer's real text is now known" — reused by
+// processTranscribeJob below (voice, once ElevenLabs returns a transcript)
+// and interviews.routes.ts's /answers handler (text, which is already its
+// own transcript with no transcription step at all — same principle as
+// collection.routes.ts's question-prompt text path). Creates the resulting
+// memory, files it into the running biography when there's a life_phase to
+// file it under, and checks whether this answer is worth offering a
+// clarifying follow-up on. Contributor is the interview SUBJECT
 // (session.person_id) — they're the one whose memory this is, the
 // facilitator just asked the question — which also lines up with only the
 // contributor being able to retract a voice-provenance memory later.
-export async function processTranscribeJob(data: TranscribeJobData, deps: TranscriptionDeps = defaultDeps) {
-  const { interviewAnswerId } = data;
-
+export async function finalizeTranscribedAnswer(
+  interviewAnswerId: string,
+  transcript: string,
+  provenanceType: "voice" | "text",
+  deps: TranscriptionDeps = defaultDeps
+) {
   const context = await withServiceContext(async (trx) => {
     const answer = await trx("interview_answers").where({ id: interviewAnswerId }).first();
     if (!answer) throw new Error(`Interview answer ${interviewAnswerId} not found`);
@@ -62,12 +78,11 @@ export async function processTranscribeJob(data: TranscribeJobData, deps: Transc
     if (!session) throw new Error(`Interview session ${answer.session_id} not found`);
     const person = await trx("persons").where({ id: session.person_id }).first();
     if (!person) throw new Error(`Person ${session.person_id} not found`);
-    const question = await trx("interview_questions").where({ id: answer.question_id }).first();
+    const question = answer.question_id
+      ? await trx("interview_questions").where({ id: answer.question_id }).first()
+      : undefined;
     return { answer, session, person, question };
   });
-
-  const audioBytes = await deps.getBytes(context.answer.audio_r2_key);
-  const transcript = await deps.transcription.transcribe(audioBytes, `${interviewAnswerId}.m4a`);
 
   const memoryId = await withServiceContext(async (trx) => {
     const [memory] = await trx("memories")
@@ -75,7 +90,7 @@ export async function processTranscribeJob(data: TranscribeJobData, deps: Transc
         family_group_id: context.person.family_group_id,
         contributor_id: context.session.person_id,
         content: transcript,
-        provenance_type: "voice",
+        provenance_type: provenanceType,
         provenance_label: context.question?.text ?? null,
       })
       .returning("id");
@@ -109,6 +124,7 @@ export async function processTranscribeJob(data: TranscribeJobData, deps: Transc
         lifePhase: context.question.life_phase,
         question: context.question.text,
         answer: transcript,
+        memoryId,
       });
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -116,6 +132,39 @@ export async function processTranscribeJob(data: TranscribeJobData, deps: Transc
     }
   }
 
+  // 2026-07-21/22 — the clarifying follow-up check. Independent try/catch
+  // from the biography one above, same principle: a Claude hiccup here
+  // shouldn't undo anything that already saved. isClarificationAnswer is
+  // true when THIS answer is itself someone's response to an earlier
+  // clarifying question — never chain a clarification off a clarification.
+  let clarifyingQuestion: string | null = null;
+  try {
+    clarifyingQuestion =
+      (await deps.offerClarification?.({
+        sessionId: context.session.id,
+        answerId: interviewAnswerId,
+        isClarificationAnswer: Boolean(context.answer.clarifies_answer_id),
+        personName: context.person.name,
+        question: context.question?.text ?? null,
+        answer: transcript,
+      })) ?? null;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(`[transcribeAnswer] clarification offer failed for answer ${interviewAnswerId}:`, err);
+  }
+
   await embeddingQueue.add("embed-memory", { memoryId });
-  return { interviewAnswerId, memoryId, transcript };
+  return { interviewAnswerId, memoryId, transcript, clarifyingQuestion };
+}
+
+export async function processTranscribeJob(data: TranscribeJobData, deps: TranscriptionDeps = defaultDeps) {
+  const { interviewAnswerId } = data;
+
+  const answer = await withServiceContext((trx) => trx("interview_answers").where({ id: interviewAnswerId }).first());
+  if (!answer) throw new Error(`Interview answer ${interviewAnswerId} not found`);
+
+  const audioBytes = await deps.getBytes(answer.audio_r2_key);
+  const transcript = await deps.transcription.transcribe(audioBytes, `${interviewAnswerId}.m4a`);
+
+  return finalizeTranscribedAnswer(interviewAnswerId, transcript, "voice", deps);
 }

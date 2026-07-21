@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
-import { View, Text, TextInput, TouchableOpacity, Switch, ScrollView, ActivityIndicator } from "react-native";
+import { View, Text, TouchableOpacity, ScrollView, ActivityIndicator } from "react-native";
 import { router, useLocalSearchParams, Stack } from "expo-router";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import type { Memory, Person, Relationship, RelationshipType } from "@myfamipedia/shared";
 import { apiClient } from "../../../lib/apiClient";
 import { useSessionIds } from "../../../lib/useSessionIds";
@@ -163,88 +163,30 @@ function MemoriesFeed({ memories }: { memories: Memory[] }) {
   );
 }
 
-// Text-only for now: mediaUrl/photoIds are accepted by the API
-// (createMemorySchema) but nothing can populate them without R2 credentials
-// being configured (apps/api's r2.service.ts is a deliberate stub) — same
-// note as apps/web's AddMemoryForm. Date is a plain YYYY-MM-DD TextInput
-// rather than a native date picker, matching mobile's existing
-// minimal-dependency approach (no new packages for one field).
-function AddMemoryForm({ personId }: { personId: string }) {
-  const queryClient = useQueryClient();
-  const [content, setContent] = useState("");
-  const [eventDate, setEventDate] = useState("");
-  const [isPrivate, setIsPrivate] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  async function onSubmit() {
-    if (!content.trim()) {
-      setError("Write something first.");
-      return;
-    }
-    setSubmitting(true);
-    setError(null);
-    try {
-      await apiClient.createMemory({
-        content: content.trim(),
-        eventDate: eventDate.trim() || null,
-        provenanceType: "text",
-        isPrivate,
-        personIds: [personId],
-        photoIds: [],
-      });
-      setContent("");
-      setEventDate("");
-      setIsPrivate(false);
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["person-memories", personId] }),
-        queryClient.invalidateQueries({ queryKey: ["person-timeline", personId] }),
-      ]);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not save this memory");
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
+// 2026-07-21 — was an always-open text box (AddMemoryForm) with two real
+// problems Tim hit live-testing: no way to tag anyone other than this
+// profile, and a placeholder string ("Share a memory…") easy to mistake for
+// typed text, producing a confusing "Write something first" error on an
+// apparently-non-empty field. Replaced with a button that deep-links into
+// the same shared compose screen the Share tab's "Share a memory" button
+// uses (../../share/compose.tsx), pre-tagged with this profile via the
+// personId param — one flow, two doors in, instead of two half-built ones.
+// The real people-picker lives there now, so tagging anyone else this
+// memory is also about is possible from here for the first time.
+function AddMemoryButton({ personId, personName }: { personId: string; personName: string }) {
   return (
-    <View
-      style={{ borderWidth: 1, borderColor: "#e5e7eb", borderRadius: 8, padding: 12, marginBottom: 16, gap: 8 }}
+    <TouchableOpacity
+      onPress={() => router.push(`/share/compose?personId=${personId}`)}
+      style={{
+        backgroundColor: "#f0f0f0",
+        borderRadius: 8,
+        padding: 14,
+        marginBottom: 16,
+        alignItems: "center",
+      }}
     >
-      <TextInput
-        placeholder="Share a memory…"
-        value={content}
-        onChangeText={setContent}
-        multiline
-        numberOfLines={3}
-        style={{ minHeight: 60, textAlignVertical: "top" }}
-      />
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
-        <TextInput
-          placeholder="Date (YYYY-MM-DD, optional)"
-          value={eventDate}
-          onChangeText={setEventDate}
-          style={{ flex: 1, borderWidth: 1, borderColor: "#ddd", borderRadius: 6, padding: 6, fontSize: 13 }}
-        />
-        <Text style={{ fontSize: 13 }}>Private</Text>
-        <Switch value={isPrivate} onValueChange={setIsPrivate} />
-      </View>
-      <TouchableOpacity
-        onPress={onSubmit}
-        disabled={submitting}
-        style={{
-          alignSelf: "flex-end",
-          backgroundColor: "#1a73e8",
-          paddingHorizontal: 14,
-          paddingVertical: 8,
-          borderRadius: 6,
-          opacity: submitting ? 0.6 : 1,
-        }}
-      >
-        <Text style={{ color: "white", fontWeight: "600" }}>{submitting ? "Saving…" : "Add memory"}</Text>
-      </TouchableOpacity>
-      {error ? <Text style={{ color: "#b3261e", fontSize: 13 }}>{error}</Text> : null}
-    </View>
+      <Text style={{ fontWeight: "600", fontSize: 15 }}>Share a memory about {personName}</Text>
+    </TouchableOpacity>
   );
 }
 
@@ -389,7 +331,7 @@ export default function PersonProfileScreen() {
       <Stack.Screen options={{ title: person.name }} />
       <ProfileHeader person={person} />
       <LifeTimeline events={timelineEvents} />
-      <AddMemoryForm personId={id} />
+      <AddMemoryButton personId={id} personName={person.name} />
       <MemoriesFeed memories={memories?.items ?? []} />
       <ConnectionsPanel profileId={id} relationships={tree?.relationships ?? []} persons={tree?.persons ?? []} />
       <View style={{ flexDirection: "row", gap: 20, marginTop: 20, marginBottom: 24 }}>

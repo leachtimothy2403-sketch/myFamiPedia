@@ -461,6 +461,7 @@ collectionRouter.post("/question-prompt/:id/answer", requireAuth, async (req: Au
             lifePhase: question.life_phase,
             question: question.text,
             answer: content,
+            memoryId,
           })
         );
       } catch (err) {

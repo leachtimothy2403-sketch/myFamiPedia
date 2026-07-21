@@ -11,9 +11,14 @@ mockQueues();
 // is the only option (and this module mock replaces the whole module, so
 // every export claude.service.ts has that interviews.routes.ts uses must be
 // listed here, not just the one under direct test).
+// generateClarifyingQuestion defaults to "nothing offered" here — the
+// clarifying-follow-up cap/backoff/no-chaining logic itself is covered at
+// the unit level in tests/services/clarification.service.test.ts; this file
+// only needs the text-answer path to not crash for its own tests below.
 vi.mock("../../src/services/claude.service", () => ({
   generateFollowUpQuestion: vi.fn(async () => ({ question: "A generated follow-up question?", lifePhase: "passions" })),
   synthesizeBiography: vi.fn(async () => "Grandma grew up in a small town and loved her tutoring program."),
+  generateClarifyingQuestion: vi.fn(async () => null),
 }));
 
 describe("interviews", () => {
@@ -308,6 +313,109 @@ describe("interviews", () => {
         .set("Authorization", `Bearer ${user.accessToken}`)
         .send({ questionId: question.id, audioR2Key: "x.mp3" });
       expect(res.status).toBe(409);
+    });
+
+    // 2026-07-21/22 — content as an alternative to audioR2Key (migration
+    // 029's real motivation: a quick clarification answer, like a name,
+    // shouldn't require re-recording voice — but this is a general addition,
+    // not clarification-specific, matching what the schema has allowed since
+    // migration 027).
+    it("accepts a text answer (content) as an alternative to audioR2Key", async () => {
+      const session = await startSession();
+      const question = await createQuestion();
+
+      const res = await ctx
+        .request()
+        .post(`/api/v1/interview-sessions/${session.id}/answers`)
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ questionId: question.id, content: "We lived two streets from the rail yard." });
+      expect(res.status).toBe(201);
+      expect(res.body).toHaveProperty("clarifyingQuestion");
+
+      const refreshed = await ctx.knex()("interview_answers").where({ id: res.body.id }).first();
+      expect(refreshed.transcript).toBe("We lived two streets from the rail yard.");
+      expect(refreshed.memory_id).toBeTruthy();
+    });
+
+    describe("clarifying follow-up", () => {
+      it("POST .../skip-clarification increments the session's skip streak", async () => {
+        const session = await startSession();
+        const question = await createQuestion();
+        const answerRes = await ctx
+          .request()
+          .post(`/api/v1/interview-sessions/${session.id}/answers`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ questionId: question.id, content: "A friend of mine helped out that summer." });
+
+        const res = await ctx
+          .request()
+          .post(`/api/v1/interview-sessions/${session.id}/answers/${answerRes.body.id}/skip-clarification`)
+          .set("Authorization", `Bearer ${user.accessToken}`);
+        expect(res.status).toBe(204);
+
+        const refreshedSession = await ctx.knex()("interview_sessions").where({ id: session.id }).first();
+        expect(refreshedSession.clarifications_skip_streak).toBe(1);
+      });
+
+      it("404s skip-clarification on an answer outside this session", async () => {
+        const session = await startSession();
+        const otherSession = await startSession();
+        const question = await createQuestion();
+        const answerRes = await ctx
+          .request()
+          .post(`/api/v1/interview-sessions/${otherSession.id}/answers`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ questionId: question.id, content: "Some answer." });
+
+        const res = await ctx
+          .request()
+          .post(`/api/v1/interview-sessions/${session.id}/answers/${answerRes.body.id}/skip-clarification`)
+          .set("Authorization", `Bearer ${user.accessToken}`);
+        expect(res.status).toBe(404);
+      });
+
+      it("answering with clarifiesAnswerId resets the session's skip streak", async () => {
+        const session = await startSession();
+        const question = await createQuestion();
+        const originalRes = await ctx
+          .request()
+          .post(`/api/v1/interview-sessions/${session.id}/answers`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ questionId: question.id, content: "A friend of mine helped out that summer." });
+        await ctx
+          .request()
+          .post(`/api/v1/interview-sessions/${session.id}/answers/${originalRes.body.id}/skip-clarification`)
+          .set("Authorization", `Bearer ${user.accessToken}`);
+
+        const res = await ctx
+          .request()
+          .post(`/api/v1/interview-sessions/${session.id}/answers`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ content: "Her name was Dorothy.", clarifiesAnswerId: originalRes.body.id });
+        expect(res.status).toBe(201);
+        expect(res.body.clarifies_answer_id).toBe(originalRes.body.id);
+
+        const refreshedSession = await ctx.knex()("interview_sessions").where({ id: session.id }).first();
+        expect(refreshedSession.clarifications_skip_streak).toBe(0);
+      });
+
+      it("404s when clarifiesAnswerId doesn't belong to this session", async () => {
+        const session = await startSession();
+        const otherSession = await startSession();
+        const question = await createQuestion();
+        const otherAnswerRes = await ctx
+          .request()
+          .post(`/api/v1/interview-sessions/${otherSession.id}/answers`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ questionId: question.id, content: "Some answer." });
+
+        const res = await ctx
+          .request()
+          .post(`/api/v1/interview-sessions/${session.id}/answers`)
+          .set("Authorization", `Bearer ${user.accessToken}`)
+          .send({ content: "Clarifying.", clarifiesAnswerId: otherAnswerRes.body.id });
+        expect(res.status).toBe(404);
+      });
     });
   });
 

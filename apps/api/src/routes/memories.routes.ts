@@ -1,10 +1,33 @@
 import { Router } from "express";
+import type { Knex } from "knex";
 import { requireAuth, AuthedRequest, requireFamilyAdministrator } from "../middleware/auth";
 import { withRlsContext } from "../db/pool";
 import { notificationQueue, embeddingQueue, memoryBiographyQueue } from "../jobs/queue";
 import { HttpError } from "../utils/httpError";
 import { isValidDate } from "../utils/isValidDate";
 import { presignDownload } from "../services/r2.service";
+import { getBiographySectionsForMemory, recomputeBiographySection } from "../services/biography.service";
+import { suggestMentionedPersons } from "../services/claude.service";
+
+// Shared by retract and restore below — both flip memories.retracted (in
+// opposite directions) and then need the exact same follow-up: find every
+// biography section this memory ever fed (getBiographySectionsForMemory,
+// migration 028) and rebuild each one from whatever sources are live now.
+// Non-fatal, same convention as every other biography-touching call site
+// this week (question-prompt's answer route, memoryBiography.worker.ts) — a
+// Claude hiccup here shouldn't undo the retract/restore action that already
+// committed successfully.
+async function recomputeBiographyForMemory(trx: Knex.Transaction | Knex, memoryId: string) {
+  const sections = await getBiographySectionsForMemory(trx, memoryId);
+  for (const section of sections) {
+    try {
+      await recomputeBiographySection(trx, section);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(`[memories] biography recompute failed for memory ${memoryId}, person ${section.personId}, category ${section.lifePhase}:`, err);
+    }
+  }
+}
 
 export const memoriesRouter = Router();
 
@@ -21,6 +44,48 @@ async function safePresignDownload(r2Key: string): Promise<string | null> {
     return null;
   }
 }
+
+// 2026-07-21 — the compose screen's "suggest people" affordance (mobile's new
+// quick-compose flow, see the Share-tab redesign). Text-only "who's this
+// about" suggestion — see claude.service.ts's suggestMentionedPersons for why
+// this reads plain text for name mentions rather than doing anything with
+// photos/faces (that's a deliberately different, retired capability).
+// Suggestions only, never applied server-side — the client shows them as
+// tappable chips and the contributor still has to confirm each one via the
+// normal personIds field on POST /memories.
+//
+// Degrades to an empty suggestion list rather than a hard error when Claude
+// isn't configured or the call fails — this is a nice-to-have on top of a
+// fully-functional manual picker, not something that should block composing
+// a memory.
+memoriesRouter.post("/memories/suggest-tags", requireAuth, async (req: AuthedRequest, res, next) => {
+  try {
+    const { personId, familyGroupId } = req.auth!;
+    const { content } = req.body ?? {};
+    if (!content || typeof content !== "string") {
+      return res.status(400).json({ error: "content is required" });
+    }
+
+    const roster: { id: string; name: string }[] = await withRlsContext({ personId, familyGroupId }, (trx) =>
+      trx("persons")
+        .where({ family_group_id: familyGroupId })
+        .whereIn("status", ["active", "invited_pending"])
+        .whereNot({ id: personId })
+        .select("id", "name")
+    );
+
+    try {
+      const personIds = await suggestMentionedPersons(content, roster);
+      res.json({ personIds });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[memories] suggest-tags failed, returning no suggestions:", err);
+      res.json({ personIds: [] });
+    }
+  } catch (err) {
+    next(err);
+  }
+});
 
 // General memory creation — the living-person counterpart to
 // persons.routes.ts's POST /persons/:id/memories, which is deceased-profile
@@ -330,6 +395,13 @@ memoriesRouter.post("/memories/:id/retract", requireAuth, async (req: AuthedRequ
       const reactors = await trx("reactions").where({ memory_id: memory.id }).distinct("person_id");
       await trx("memories").where({ id: memory.id }).update({ retracted: true, retracted_at: new Date() });
 
+      // 2026-07-20 — closes a reported bug: this used to leave the memory's
+      // content sitting in whatever biography section(s) it had already fed
+      // (interview_biography_sections), forever, with no way to walk it back
+      // out. Rebuilds each affected section from its remaining, still-live
+      // sources — see biography.service.ts's recomputeBiographySection.
+      await recomputeBiographyForMemory(trx, memory.id);
+
       await Promise.all(
         reactors.map((r: { person_id: string }) =>
           notificationQueue.add("memory-retracted", {
@@ -392,6 +464,10 @@ memoriesRouter.post("/memories/:id/restore", requireAuth, async (req: AuthedRequ
       if (!memory.retracted) throw new HttpError(409, "This memory is not retracted, so there is nothing to restore");
 
       await trx("memories").where({ id: memory.id }).update({ retracted: false, retracted_at: null });
+
+      // Symmetric with retract above — bringing the content back should bring
+      // it back into the biography too, not leave it permanently excluded.
+      await recomputeBiographyForMemory(trx, memory.id);
     });
     res.status(204).send();
   } catch (err) {

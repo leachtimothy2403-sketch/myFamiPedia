@@ -1,4 +1,4 @@
-import { View, Text, Button, FlatList, ActivityIndicator } from "react-native";
+import { View, Text, Button, FlatList, ActivityIndicator, TouchableOpacity } from "react-native";
 import { router } from "expo-router";
 import { useQuery } from "@tanstack/react-query";
 import { apiClient } from "../../lib/apiClient";
@@ -21,9 +21,15 @@ function FeedItem({ memory }: { memory: FeedMemory }) {
   );
 }
 
-// Home: memory feed (section 9). The "manage your memories" icon in the
-// header links to collection/manage.tsx; "N memories to review" notifications
-// deep-link to collection/review.tsx (see mobile_app_structure.md).
+// Home: memory feed (section 9), pure consumption — nothing about adding
+// content lives here anymore (2026-07-21 Share-tab redesign). "Manage" (view/
+// organize memories you already have) stayed, since browsing your own
+// archive is a "look at your stuff" action same as the feed itself; "Review
+// proposed memories," "Add a photo," and "Sync camera roll" moved to the
+// Share tab (the hub's conditional "Photos to review" button, and two
+// secondary links added to the top of collection/review.tsx) since all three
+// are ways of adding/contributing, not consuming. The "N memories to review"
+// notification still deep-links straight into collection/review.tsx, unaffected.
 //
 // This was previously fetching /notifications and throwing every row away
 // (renderItem returned null), so the feed always looked empty no matter what
@@ -41,15 +47,33 @@ export default function HomeScreen() {
     enabled: Boolean(familyGroupId),
   });
 
+  // Same GET /collection/proposed the Share hub's own conditional button
+  // reads (["proposed-memories"] query key, cache-shared) — a plain labeled
+  // banner instead of Home's old unconditional "Review proposed memories"
+  // button, so this only ever appears when there's actually something
+  // waiting, worded in plain words rather than an icon.
+  const { data: proposed } = useQuery({
+    queryKey: ["proposed-memories"],
+    queryFn: () => apiClient.request<{ items: unknown[] }>("/collection/proposed"),
+  });
+  const reviewCount = proposed?.items?.length ?? 0;
+
   return (
     <View style={{ flex: 1, padding: 16, gap: 12 }}>
       <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
         <Text style={{ fontSize: 20, fontWeight: "600" }}>Family feed</Text>
         <Button title="Manage" onPress={() => router.push("/collection/manage")} />
       </View>
-      <Button title="Review proposed memories" onPress={() => router.push("/collection/review")} />
-      <Button title="Add a photo" onPress={() => router.push("/collection/add-photo")} />
-      <Button title="Sync camera roll" onPress={() => router.push("/collection/camera-roll-sync")} />
+      {reviewCount > 0 ? (
+        <TouchableOpacity
+          onPress={() => router.push("/collection/review")}
+          style={{ backgroundColor: "#e8f0fe", borderRadius: 8, padding: 12 }}
+        >
+          <Text style={{ color: "#1a73e8", fontWeight: "600" }}>
+            {reviewCount} photo{reviewCount === 1 ? "" : "s"} need a quick look
+          </Text>
+        </TouchableOpacity>
+      ) : null}
       {sessionLoading || feedLoading ? (
         <ActivityIndicator />
       ) : (

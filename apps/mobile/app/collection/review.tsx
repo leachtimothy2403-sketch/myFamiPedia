@@ -16,8 +16,14 @@ interface ProposedMemory {
 }
 
 // Section 2 proposal queue — 2-tap accept/reject, under two minutes per the
-// product doc. Reachable from the Home header and via the "N memories to
-// review" notification deep-link.
+// product doc. Reachable from the Share tab's conditional "Photos to review"
+// button (only shown when something's actually waiting — (tabs)/share-story.tsx)
+// and via the "N memories to review" notification deep-link.
+//
+// "Add a photo" and "Sync camera roll" (2026-07-21) moved here from Home's
+// header, alongside this — all three are ways of getting photos into the
+// pipeline, so they now live together on the photo-review screen rather than
+// competing with the feed for space on Home.
 export default function CollectionReviewScreen() {
   const qc = useQueryClient();
   const { data } = useQuery({
@@ -48,6 +54,10 @@ export default function CollectionReviewScreen() {
   return (
     <View style={{ flex: 1, padding: 16 }}>
       <Text style={{ fontSize: 20, fontWeight: "600", marginBottom: 12 }}>Memories to review</Text>
+      <View style={{ flexDirection: "row", gap: 12, marginBottom: 16 }}>
+        <Button title="Add a photo" onPress={() => router.push("/collection/add-photo")} />
+        <Button title="Sync camera roll" onPress={() => router.push("/collection/camera-roll-sync")} />
+      </View>
       <FlatList
         data={data?.items ?? []}
         keyExtractor={(item) => item.id}

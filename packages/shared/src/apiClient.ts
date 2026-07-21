@@ -199,6 +199,32 @@ export class ApiClient {
     return this.request<Memory>("/memories", { method: "POST", body: input });
   }
 
+  // Question-stream nudge (docs/section2_pipeline.md section 4) — the
+  // periodic "answer one quick question" prompt, surfaced 2026-07-22 as a
+  // banner on the Share hub (previously API-only, no screen read from it).
+  async getQuestionPrompt(personId: string) {
+    return this.request<{ question: { id: string; text: string; lifePhase: string } | null }>(
+      `/persons/${personId}/question-prompt`
+    );
+  }
+
+  async answerQuestionPrompt(questionId: string, input: { content?: string; audioR2Key?: string }) {
+    return this.request<{ id: string; memoryId: string }>(`/question-prompt/${questionId}/answer`, {
+      method: "POST",
+      body: input,
+    });
+  }
+
+  // Text-only "who's this about" suggestion for the quick-compose screen —
+  // never auto-applied, the client shows these as tappable chips. See
+  // claude.service.ts's suggestMentionedPersons for why this only reads
+  // plain text for name mentions (photo/face-based matching is a
+  // deliberately different, retired capability, see
+  // docs/family_administrator_and_privacy_model.md section 5).
+  async suggestMemoryTags(content: string) {
+    return this.request<{ personIds: string[] }>("/memories/suggest-tags", { method: "POST", body: { content } });
+  }
+
   async reactToMemory(memoryId: string, input: ReactToMemoryInput) {
     return this.request(`/memories/${memoryId}/react`, { method: "POST", body: input });
   }

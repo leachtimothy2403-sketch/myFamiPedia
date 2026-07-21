@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { View, Text, TouchableOpacity, ActivityIndicator } from "react-native";
+import { View, Text, TextInput, TouchableOpacity, ActivityIndicator } from "react-native";
 import { router, useLocalSearchParams } from "expo-router";
 import { useAudioRecorder, useAudioRecorderState, RecordingPresets, AudioModule, setAudioModeAsync } from "expo-audio";
 import { apiClient } from "../../../lib/apiClient";
@@ -42,6 +42,17 @@ export default function InterviewSessionScreen() {
     text: questionText,
   });
   const [qaExhausted, setQaExhausted] = useState(false);
+
+  // 2026-07-21/22 — the clarifying follow-up (migration 029). Set right
+  // after an answer saves, when the server offers one; recording controls
+  // and the next question both stay hidden until this resolves (answered or
+  // skipped), same "one thing at a time" principle as the rest of this
+  // screen. Text input rather than voice — a clarification is usually one
+  // short fact (a name, a date), and typing it is a lot less friction than
+  // re-recording for one word; the API accepts either.
+  const [clarification, setClarification] = useState<{ answerId: string; question: string } | null>(null);
+  const [clarificationText, setClarificationText] = useState("");
+  const [clarifying, setClarifying] = useState(false);
 
   async function startRecording() {
     setError(null);
@@ -92,16 +103,59 @@ export default function InterviewSessionScreen() {
       });
       if (!putResponse.ok) throw new Error("Upload to storage failed — try again.");
 
-      await apiClient.request(`/interview-sessions/${sessionId}/answers`, {
-        method: "POST",
-        body: { questionId: question.id ?? undefined, audioR2Key: r2Key },
-      });
+      const saved = await apiClient.request<{ id: string; clarifyingQuestion: string | null }>(
+        `/interview-sessions/${sessionId}/answers`,
+        {
+          method: "POST",
+          body: { questionId: question.id ?? undefined, audioR2Key: r2Key },
+        }
+      );
       setSavedCount((c) => c + 1);
-      if (isQAFlow) await advanceToNextQuestion();
+      if (saved.clarifyingQuestion) {
+        // Hold off advancing until this resolves — see resolveClarification.
+        setClarification({ answerId: saved.id, question: saved.clarifyingQuestion });
+      } else if (isQAFlow) {
+        await advanceToNextQuestion();
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Couldn't save this answer");
     } finally {
       setUploading(false);
+    }
+  }
+
+  // Answering ("submit") or skipping both resolve the same way afterward:
+  // clear the clarification state and continue the session exactly as if it
+  // had never come up (advance to the next question in a Q&A flow, or just
+  // sit at "Ready" for open-ended/photo-prompted). Skip is deliberately one
+  // tap, no confirmation, no explanation required — it has to be at least as
+  // easy as answering.
+  async function resolveClarification(action: "answer" | "skip") {
+    if (!clarification) return;
+    setClarifying(true);
+    setError(null);
+    try {
+      if (action === "answer") {
+        if (!clarificationText.trim()) {
+          setError("Type an answer, or tap Skip.");
+          return;
+        }
+        await apiClient.request(`/interview-sessions/${sessionId}/answers`, {
+          method: "POST",
+          body: { content: clarificationText.trim(), clarifiesAnswerId: clarification.answerId },
+        });
+      } else {
+        await apiClient.request(`/interview-sessions/${sessionId}/answers/${clarification.answerId}/skip-clarification`, {
+          method: "POST",
+        });
+      }
+      setClarification(null);
+      setClarificationText("");
+      if (isQAFlow) await advanceToNextQuestion();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't save that — try again.");
+    } finally {
+      setClarifying(false);
     }
   }
 
@@ -149,6 +203,44 @@ export default function InterviewSessionScreen() {
   }
 
   const busy = uploading || finishing;
+
+  if (clarification) {
+    return (
+      <View style={{ flex: 1, padding: 16, gap: 16 }}>
+        <View style={{ backgroundColor: "#fafafa", borderRadius: 12, padding: 16, gap: 12 }}>
+          <Text style={{ fontSize: 13, color: "#666", fontWeight: "600" }}>QUICK ONE</Text>
+          <Text style={{ fontSize: 17, fontWeight: "600" }}>{clarification.question}</Text>
+          <TextInput
+            placeholder="Type your answer…"
+            value={clarificationText}
+            onChangeText={setClarificationText}
+            style={{ borderWidth: 1, borderColor: "#ddd", borderRadius: 8, padding: 10, fontSize: 16, backgroundColor: "white" }}
+          />
+        </View>
+
+        {/* Equal visual weight on purpose — skipping has to be at least as
+            easy as answering, never a smaller or guiltier-looking option. */}
+        <View style={{ flexDirection: "row", gap: 12 }}>
+          <TouchableOpacity
+            onPress={() => resolveClarification("skip")}
+            disabled={clarifying}
+            style={{ flex: 1, backgroundColor: "#f0f0f0", paddingVertical: 14, borderRadius: 8, opacity: clarifying ? 0.6 : 1 }}
+          >
+            <Text style={{ fontWeight: "600", textAlign: "center" }}>Skip</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => resolveClarification("answer")}
+            disabled={clarifying}
+            style={{ flex: 1, backgroundColor: "#1a73e8", paddingVertical: 14, borderRadius: 8, opacity: clarifying ? 0.6 : 1 }}
+          >
+            <Text style={{ color: "white", fontWeight: "600", textAlign: "center" }}>{clarifying ? "Saving…" : "Answer"}</Text>
+          </TouchableOpacity>
+        </View>
+
+        {error ? <Text style={{ color: "#b3261e", fontSize: 13 }}>{error}</Text> : null}
+      </View>
+    );
+  }
 
   return (
     <View style={{ flex: 1, padding: 16, gap: 12 }}>

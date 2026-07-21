@@ -594,3 +594,86 @@ describe("claude.service — classifyMemoryCategory", () => {
     expect(capturedPrompt).toContain("NONE");
   });
 });
+
+describe("claude.service — generateClarifyingQuestion", () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    const { env } = await import("../../src/config/env");
+    env.anthropicApiKey = "test-key";
+  });
+
+  it("throws a clear, catchable error when ANTHROPIC_API_KEY is not configured", async () => {
+    const { env } = await import("../../src/config/env");
+    env.anthropicApiKey = "";
+    const { generateClarifyingQuestion } = await import("../../src/services/claude.service");
+    await expect(
+      generateClarifyingQuestion({ personName: "Peggy", question: "Tell me about a friend.", answer: "A friend helped out." })
+    ).rejects.toThrow(/ANTHROPIC_API_KEY/);
+  });
+
+  it("returns the clarifying question Claude generates, trimmed of surrounding quotes", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({ content: [{ type: "text", text: `"Do you remember her name?"` }] }) }))
+    );
+    const { generateClarifyingQuestion } = await import("../../src/services/claude.service");
+    const result = await generateClarifyingQuestion({
+      personName: "Peggy",
+      question: "Tell me about a friend.",
+      answer: "A friend of mine helped out that summer.",
+    });
+    expect(result).toBe("Do you remember her name?");
+  });
+
+  it("returns null for Claude's explicit NONE response", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({ content: [{ type: "text", text: "NONE" }] }) }))
+    );
+    const { generateClarifyingQuestion } = await import("../../src/services/claude.service");
+    const result = await generateClarifyingQuestion({ personName: "Peggy", question: "How was school?", answer: "Fine, nothing special." });
+    expect(result).toBeNull();
+  });
+
+  it("includes the person's name, the question (when given), and the answer in the prompt", async () => {
+    let capturedPrompt = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: { body: string }) => {
+        capturedPrompt = JSON.parse(init.body).messages[0].content as string;
+        return { ok: true, json: async () => ({ content: [{ type: "text", text: "NONE" }] }) };
+      })
+    );
+    const { generateClarifyingQuestion } = await import("../../src/services/claude.service");
+    await generateClarifyingQuestion({ personName: "Peggy", question: "What was your first job?", answer: "Kessler's Department Store." });
+    expect(capturedPrompt).toContain("Peggy");
+    expect(capturedPrompt).toContain("What was your first job?");
+    expect(capturedPrompt).toContain("Kessler's Department Store.");
+    expect(capturedPrompt).toContain("NONE");
+  });
+
+  it("omits the question from the prompt when it's null (open-ended answers)", async () => {
+    let capturedPrompt = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: { body: string }) => {
+        capturedPrompt = JSON.parse(init.body).messages[0].content as string;
+        return { ok: true, json: async () => ({ content: [{ type: "text", text: "NONE" }] }) };
+      })
+    );
+    const { generateClarifyingQuestion } = await import("../../src/services/claude.service");
+    await generateClarifyingQuestion({ personName: "Peggy", question: null, answer: "Just sharing a memory." });
+    // Checking for the absence of a generic '("' substring was wrong — the
+    // prompt's own static instructions legitimately contain that pattern
+    // several times (the person/place/date examples). What actually
+    // signals "no question was interpolated" is the parenthetical right
+    // after "family-history interview" being omitted entirely, i.e. the
+    // sentence goes straight from "interview" to the colon.
+    expect(capturedPrompt).toContain("family-history interview:");
+    expect(capturedPrompt).toContain("Just sharing a memory.");
+  });
+});

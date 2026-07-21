@@ -1,8 +1,21 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
 import { withApp, registerTestUser, type TestUser } from "../helpers/withApp";
 import { mockQueues, getQueueMock } from "../helpers/queueMock";
 
 mockQueues();
+
+// Retract/restore's biography-recompute call (memories.routes.ts ->
+// biography.service.ts's recomputeBiographySection -> claude.service.ts's
+// rebuildBiographySectionSummary) is a real Anthropic call — stubbed the
+// same importOriginal-based way biography.service.test.ts's own tests are,
+// for the same reason documented there: a bare vi.mock of config/env would
+// blow away databaseUrl and break withApp()'s DB connection, since this file
+// needs both a real DB and a deterministic, offline Claude double regardless
+// of whether a real ANTHROPIC_API_KEY happens to be set locally.
+vi.mock("../../src/config/env", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/config/env")>();
+  return { env: { ...actual.env, anthropicApiKey: "test-key" } };
+});
 
 describe("memories", () => {
   const ctx = withApp();
@@ -40,6 +53,69 @@ describe("memories", () => {
   // schemas in packages/shared (createMemorySchema included) — this endpoint
   // still does ad-hoc manual checks matching its existing style, not a zod
   // parse; that's a wider, pre-existing gap, not something fixed here.
+  // 2026-07-21 — the compose screen's "suggest people" affordance, answering
+  // Tim's "can tagging be auto-detected?" question for the text half only
+  // (see claude.service.ts's suggestMentionedPersons comment for why the
+  // photo/face half is deliberately not built).
+  describe("POST /memories/suggest-tags", () => {
+    afterEach(() => vi.unstubAllGlobals());
+
+    function mockClaudeIds(text: string) {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => ({ ok: true, json: async () => ({ content: [{ type: "text", text }] }) }))
+      );
+    }
+
+    it("returns suggested person ids mentioned by name in the content", async () => {
+      const [grandma] = await ctx.knex()("persons").insert({ family_group_id: user.familyGroupId, name: "Grandma", status: "active" }).returning("*");
+      mockClaudeIds(grandma.id);
+
+      const res = await ctx
+        .request()
+        .post("/api/v1/memories/suggest-tags")
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ content: "Grandma used to sing in the choir every Sunday." });
+      expect(res.status).toBe(200);
+      expect(res.body.personIds).toEqual([grandma.id]);
+    });
+
+    it("returns an empty list when Claude says NONE", async () => {
+      await ctx.knex()("persons").insert({ family_group_id: user.familyGroupId, name: "Grandma", status: "active" });
+      mockClaudeIds("NONE");
+
+      const res = await ctx
+        .request()
+        .post("/api/v1/memories/suggest-tags")
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ content: "A nice quiet day." });
+      expect(res.status).toBe(200);
+      expect(res.body.personIds).toEqual([]);
+    });
+
+    it("drops a hallucinated id that isn't actually in the roster", async () => {
+      await ctx.knex()("persons").insert({ family_group_id: user.familyGroupId, name: "Grandma", status: "active" });
+      mockClaudeIds("00000000-0000-0000-0000-000000000000");
+
+      const res = await ctx
+        .request()
+        .post("/api/v1/memories/suggest-tags")
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({ content: "Something about someone." });
+      expect(res.status).toBe(200);
+      expect(res.body.personIds).toEqual([]);
+    });
+
+    it("requires content", async () => {
+      const res = await ctx
+        .request()
+        .post("/api/v1/memories/suggest-tags")
+        .set("Authorization", `Bearer ${user.accessToken}`)
+        .send({});
+      expect(res.status).toBe(400);
+    });
+  });
+
   describe("POST /memories", () => {
     it("creates a text memory with tagged persons and attached photos", async () => {
       const [photo] = await ctx
@@ -580,6 +656,114 @@ describe("memories", () => {
         .post(`/api/v1/memories/${memory.id}/restore`)
         .set("Authorization", `Bearer ${user.accessToken}`);
       expect(res.status).toBe(409);
+    });
+
+    // 2026-07-20 — the actual bug Tim reported live: retracting a Q&A answer
+    // (or any memory) left its content sitting in the running biography
+    // forever, since recordAnswerInBiography only ever folds content IN.
+    // These exercise the fix end to end: retract/restore now rebuild the
+    // affected section(s) from whatever interview_biography_sources rows
+    // still have a live memory behind them (biography.service.ts's
+    // recomputeBiographySection, migration 028).
+    describe("retract/restore recomputes the affected biography section", () => {
+      afterEach(() => vi.unstubAllGlobals());
+
+      function mockRebuiltSummary(text: string) {
+        vi.stubGlobal(
+          "fetch",
+          vi.fn(async () => ({ ok: true, json: async () => ({ content: [{ type: "text", text }] }) }))
+        );
+      }
+
+      async function seedSection(memoryIds: { id: string; stem: string; content: string }[]) {
+        await ctx.knex()("interview_biography_sections").insert({
+          person_id: user.personId,
+          life_phase: "childhood",
+          summary: "Grew up near the rail yard and had a cat named Rusty.",
+          asked_question_stems: memoryIds.map((m) => m.stem),
+          question_count: memoryIds.length,
+        });
+        await ctx.knex()("interview_biography_sources").insert(
+          memoryIds.map((m) => ({
+            person_id: user.personId,
+            life_phase: "childhood",
+            memory_id: m.id,
+            stem: m.stem,
+            content: m.content,
+          }))
+        );
+      }
+
+      it("rebuilds the section without the retracted memory's content", async () => {
+        const memoryA = await createMemory({ content: "We lived two streets from the rail yard." });
+        const memoryB = await createMemory({ content: "I found a stray cat and named him Rusty." });
+        await seedSection([
+          { id: memoryA.id, stem: "street", content: memoryA.content },
+          { id: memoryB.id, stem: "(memory shared: \"cat\")", content: memoryB.content },
+        ]);
+        mockRebuiltSummary("Grew up near the rail yard.");
+
+        const res = await ctx
+          .request()
+          .post(`/api/v1/memories/${memoryB.id}/retract`)
+          .set("Authorization", `Bearer ${user.accessToken}`);
+        expect(res.status).toBe(204);
+
+        const section = await ctx
+          .knex()("interview_biography_sections")
+          .where({ person_id: user.personId, life_phase: "childhood" })
+          .first();
+        expect(section.summary).toBe("Grew up near the rail yard.");
+        expect(section.asked_question_stems).toEqual(["street"]);
+        expect(section.question_count).toBe(1);
+      });
+
+      it("brings the content back into the rebuilt section on restore", async () => {
+        const memoryA = await createMemory({ content: "We lived two streets from the rail yard." });
+        const memoryB = await createMemory({ content: "I found a stray cat and named him Rusty." });
+        await seedSection([
+          { id: memoryA.id, stem: "street", content: memoryA.content },
+          { id: memoryB.id, stem: "(memory shared: \"cat\")", content: memoryB.content },
+        ]);
+
+        mockRebuiltSummary("Grew up near the rail yard.");
+        await ctx
+          .request()
+          .post(`/api/v1/memories/${memoryB.id}/retract`)
+          .set("Authorization", `Bearer ${user.accessToken}`);
+
+        mockRebuiltSummary("Grew up near the rail yard and rescued a stray cat named Rusty.");
+        const res = await ctx
+          .request()
+          .post(`/api/v1/memories/${memoryB.id}/restore`)
+          .set("Authorization", `Bearer ${user.accessToken}`);
+        expect(res.status).toBe(204);
+
+        const section = await ctx
+          .knex()("interview_biography_sections")
+          .where({ person_id: user.personId, life_phase: "childhood" })
+          .first();
+        expect(section.summary).toBe("Grew up near the rail yard and rescued a stray cat named Rusty.");
+        expect(section.asked_question_stems.sort()).toEqual(["(memory shared: \"cat\")", "street"].sort());
+        expect(section.question_count).toBe(2);
+      });
+
+      it("deletes the section entirely when retracting its only surviving source", async () => {
+        const memory = await createMemory({ content: "I found a stray cat and named him Rusty." });
+        await seedSection([{ id: memory.id, stem: "(memory shared: \"cat\")", content: memory.content }]);
+
+        const res = await ctx
+          .request()
+          .post(`/api/v1/memories/${memory.id}/retract`)
+          .set("Authorization", `Bearer ${user.accessToken}`);
+        expect(res.status).toBe(204);
+
+        const section = await ctx
+          .knex()("interview_biography_sections")
+          .where({ person_id: user.personId, life_phase: "childhood" })
+          .first();
+        expect(section).toBeUndefined();
+      });
     });
   });
 

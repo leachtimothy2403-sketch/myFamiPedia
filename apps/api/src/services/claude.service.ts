@@ -361,7 +361,9 @@ A new question in this category was just answered:
 Q: ${input.question}
 A: ${input.answer}
 
-Write an UPDATED summary for this one category that folds the new answer in naturally alongside what's already known — integrate it, don't just tack a new sentence on the end. Keep specific names, dates, and concrete details (they're what make this feel like a real person, not a generic bio), but stay tight: no more than 5-6 sentences total for this whole category, even as more gets added over time — if it's getting long, tighten or drop less-important older material rather than letting it grow forever. Third person ("he"/"she"/"they"), warm biographical prose, no headers, no bullet points, no preamble — just the summary text itself.`;
+Write an UPDATED summary for this one category that folds the new answer in naturally alongside what's already known — integrate it, don't just tack a new sentence on the end. Keep specific names, dates, and concrete details (they're what make this feel like a real person, not a generic bio), but stay tight: no more than 5-6 sentences total for this whole category, even as more gets added over time — if it's getting long, tighten or drop less-important older material rather than letting it grow forever. Third person ("he"/"she"/"they"), warm biographical prose, no headers, no bullet points, no preamble — just the summary text itself.
+
+Do not invent or infer any name, date, place, or detail that wasn't stated in the existing summary or this new answer. Smoothing sentences together and choosing warm phrasing is fine; adding new facts, motivations, or specifics to fill a gap is not — if the connective tissue between two facts isn't known, leave it implicit or vague rather than making something up.`;
 
   return callAnthropic(prompt, 400);
 }
@@ -394,9 +396,47 @@ export async function synthesizeBiography(input: {
 
 ${sectionsText}
 
-Write a single flowing "who they were" biography, a few warm paragraphs, weaving these categories together into one coherent life story rather than listing them one by one — the way a family member might describe someone they loved, not a résumé. Keep concrete, specific details (names, dates, particular stories) rather than generic statements. Third person. No headers, no bullet points, no category labels, no preamble — just the biography itself.`;
+Write a single flowing "who they were" biography, a few warm paragraphs, weaving these categories together into one coherent life story rather than listing them one by one — the way a family member might describe someone they loved, not a résumé. Keep concrete, specific details (names, dates, particular stories) rather than generic statements. Third person. No headers, no bullet points, no category labels, no preamble — just the biography itself.
+
+This is a legacy document a family will read as fact, not a creative exercise — do not invent or infer any name, date, place, relationship, or event that isn't already present in the section summaries above. You may connect and rephrase what's given, but never add new specifics to smooth a transition or fill a gap; leave transitions vague rather than fabricated.`;
 
   return callAnthropic(prompt, 1200);
+}
+
+// 2026-07-20 — the rebuild half of fixing retraction (biography.service.ts's
+// recomputeBiographySection, the only caller). updateBiographySectionSummary
+// above is deliberately incremental — one new answer folded into an existing
+// summary — which is exactly why retracting an old answer can't just "undo"
+// its effect on that summary; there's no record of which sentence came from
+// which answer. The only correct fix is regenerating the whole section from
+// scratch from whatever sources still stand, which is what this does: unlike
+// updateBiographySectionSummary, there's no existingSummary input at all —
+// past output is discarded entirely and never fed back in, so nothing a
+// withdrawn contribution influenced can persist into the rebuilt version.
+export async function rebuildBiographySectionSummary(input: {
+  personName: string;
+  lifePhase: string;
+  answers: string[];
+}): Promise<string> {
+  if (!env.anthropicApiKey) {
+    throw new Error(
+      "rebuildBiographySectionSummary is not configured — set ANTHROPIC_API_KEY. See docs/section2_pipeline.md section 4."
+    );
+  }
+
+  const answersText = input.answers.map((a, i) => `${i + 1}. ${a}`).join("\n\n");
+
+  const prompt = `You are writing a running biographical summary of ${input.personName}'s life, one life-story category at a time — this one is "${input.lifePhase}". It's later assembled with the other categories into a "who they were" narrative for their family.
+
+Below are all the pieces of first-hand content currently standing for this one category (this is a full rebuild, not an incremental update — some earlier material may have since been withdrawn by its contributor, which is exactly why only what's listed below, and nothing else, should inform the result):
+
+${answersText}
+
+Write a summary for this one category that weaves these together naturally into one coherent passage — integrate, don't just list them one by one. Keep specific names, dates, and concrete details, but stay tight: no more than 5-6 sentences total. Third person ("he"/"she"/"they"), warm biographical prose, no headers, no bullet points, no preamble — just the summary text itself.
+
+This is a legacy document a family will read as fact — do not invent or infer any name, date, place, or detail that isn't stated in the content above. Smoothing sentences together and choosing warm phrasing is fine; adding a new fact to fill a gap is not.`;
+
+  return callAnthropic(prompt, 500);
 }
 
 // 2026-07-20 — memories.routes.ts's "share a memory directly" (POST
@@ -432,6 +472,102 @@ If the memory is too short, vague, or general to confidently place in one specif
   const text = await callAnthropic(prompt, 20);
   const normalized = text.trim().toLowerCase().replace(/[.\s]+$/, "");
   return isInterviewCategory(normalized) ? normalized : null;
+}
+
+// 2026-07-21 — answers Tim's "can tagging be auto-detected?" question, but
+// only the text half of it. The photo half (matching a detected face to a
+// specific known person) is deliberately NOT built here or anywhere else:
+// docs/family_administrator_and_privacy_model.md section 5 retired real
+// face-matching entirely (GDPR Article 9 biometric-data exposure, no legal
+// sign-off) — apps/api/src/jobs/faceDetection.worker.ts's own header comment
+// confirms detection only ever returns bounding boxes now, never an identity
+// match. Reading plain text someone typed for family-member NAME mentions
+// against the family's own roster is a completely different, much lower-risk
+// thing (no biometric processing at all) and doesn't cross that line.
+//
+// Suggestions only — never auto-applied. compose screens show these as
+// tappable chips the contributor confirms, same reasoning as
+// classifyMemoryCategory returning null rather than forcing a guess: wrongly
+// tagging a real person into someone else's memory is worse than not
+// suggesting anything.
+export async function suggestMentionedPersons(
+  content: string,
+  roster: { id: string; name: string }[]
+): Promise<string[]> {
+  if (!env.anthropicApiKey) {
+    throw new Error("suggestMentionedPersons is not configured — set ANTHROPIC_API_KEY. See docs/section2_pipeline.md section 4.");
+  }
+  if (roster.length === 0) return [];
+
+  const rosterList = roster.map((p) => `${p.id}: ${p.name}`).join("\n");
+  const prompt = `Below is a memory someone is writing in a family history app, and a roster of their family members (id: name).
+
+Memory text:
+"${content}"
+
+Family roster:
+${rosterList}
+
+Which people from the roster, if any, are clearly mentioned BY NAME in the memory text? Only include someone if their name (or an unambiguous nickname of it) actually appears in the text — never guess based on the memory's subject matter or who seems likely to be involved.
+
+Respond with ONLY a comma-separated list of matching ids, nothing else — no names, no explanation. If nobody from the roster is mentioned by name, respond with exactly: NONE`;
+
+  const text = await callAnthropic(prompt, 200);
+  const normalized = text.trim();
+  if (normalized.toUpperCase() === "NONE") return [];
+
+  const rosterIds = new Set(roster.map((p) => p.id));
+  const candidateIds = normalized
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  // Defensive against a hallucinated id that isn't actually in the roster —
+  // silently dropped rather than surfaced, same "don't force a bad match"
+  // principle as the NONE case.
+  return candidateIds.filter((id) => rosterIds.has(id));
+}
+
+// 2026-07-21/22 — the "Tell your story" clarifying follow-up Tim asked for:
+// right after an answer, check whether it clearly leaves out one specific,
+// nameable fact (a person's name, a place, a date) worth asking about.
+// Pairs with the anti-fabrication fix earlier this week to
+// updateBiographySectionSummary/synthesizeBiography — better to get the real
+// detail from the storyteller directly than let the summarizer either guess
+// or leave a gap vague forever.
+//
+// Deliberately conservative: this should say NONE for the large majority of
+// answers. Ordinary conversational vagueness ("a while later", "somewhere
+// downtown") is fine and shouldn't be flagged — only an answer that clearly
+// refers to something specific-but-unnamed, where naming it would actually
+// add to the biography, should trigger a question. See
+// clarification.service.ts for the caps that bound how often this ever gets
+// asked even when it does fire (at most once per answer, a session-wide
+// soft ceiling, and a skip-streak backoff).
+export async function generateClarifyingQuestion(input: {
+  personName: string;
+  question: string | null;
+  answer: string;
+}): Promise<string | null> {
+  if (!env.anthropicApiKey) {
+    throw new Error("generateClarifyingQuestion is not configured — set ANTHROPIC_API_KEY. See docs/section2_pipeline.md section 4.");
+  }
+
+  const prompt = `${input.personName} just answered a question in a family-history interview${
+    input.question ? ` ("${input.question}")` : ""
+  }:
+
+"${input.answer}"
+
+Does this answer clearly refer to something specific but leave it unnamed — a person ("a friend of mine", "my old boss"), a place ("the store", "a town nearby"), or a date/time period ("a few years later", "sometime in the 50s") — where getting that one detail would genuinely add something real to their biography?
+
+Only say yes for a genuine, nameable gap like that. Do NOT flag ordinary conversational vagueness that doesn't need pinning down — most answers are already complete as they are, and this should say NONE far more often than not.
+
+If there's a real gap worth asking about, respond with ONLY one short, warm, conversational follow-up question (one sentence, no preamble, no quotation marks). If not, respond with exactly: NONE`;
+
+  const text = await callAnthropic(prompt, 60);
+  const normalized = text.trim();
+  if (normalized.toUpperCase() === "NONE") return null;
+  return normalized.replace(/^["']|["']$/g, "");
 }
 
 export interface PhotoClassificationResult {

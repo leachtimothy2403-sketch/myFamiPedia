@@ -1,182 +1,141 @@
 import { useState } from "react";
-import { View, Text, TouchableOpacity, ActivityIndicator } from "react-native";
+import { View, Text, TextInput, TouchableOpacity } from "react-native";
 import { router } from "expo-router";
-import { useQuery } from "@tanstack/react-query";
-import type { Person } from "@myfamipedia/shared";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiClient } from "../../lib/apiClient";
 import { useSessionIds } from "../../lib/useSessionIds";
 
-// Replaces the old three-screen hop (share-story "Get started" ->
-// interview/new "whose story is this" -> interview/[personId]/new "pick a
-// starting point"). Per product feedback, all of that collapses into one
-// screen with a progressive reveal: pick who this is for, then the three
-// starting-point choices appear in place. interview/new.tsx and
-// interview/[personId]/new.tsx are removed — nothing links to them anymore.
-type Subject = "self" | "other" | null;
-
-function chooserButtonStyle(selected: boolean) {
-  return {
-    backgroundColor: selected ? "#1a73e8" : "#f0f0f0",
-    padding: 14,
-    borderRadius: 8,
-    flex: 1,
-  } as const;
+// 2026-07-21 — Share tab redesign. Used to BE the interview-only flow
+// (whose story + open-ended/Q&A/photo-prompted); that content moved
+// unchanged to ../share/tell-your-story.tsx. This is now a flat hub: three
+// big, plainly-labeled buttons, each going to its own full screen — no
+// sub-tabs, no segmented control to discover first. Deliberately flat rather
+// than nested: a key user group here is older adults, and a control you
+// have to notice and tap to reveal more options is a worse pattern for that
+// audience than just showing the options.
+//
+// Consolidates what used to be three separate, half-overlapping ways to add
+// content (this screen's interview flow, a person profile's always-open
+// text box, Home's "Review proposed memories" button) into one place. See
+// docs/handover_2026-07-21-share-tab-redesign.md for the full writeup.
+function HubButton({ label, sublabel, onPress }: { label: string; sublabel: string; onPress: () => void }) {
+  return (
+    <TouchableOpacity
+      onPress={onPress}
+      style={{
+        backgroundColor: "#f0f0f0",
+        borderRadius: 12,
+        padding: 20,
+        gap: 4,
+      }}
+    >
+      <Text style={{ fontSize: 18, fontWeight: "700" }}>{label}</Text>
+      <Text style={{ fontSize: 14, color: "#666" }}>{sublabel}</Text>
+    </TouchableOpacity>
+  );
 }
 
-function activityButtonStyle(disabled: boolean) {
-  return {
-    backgroundColor: "#f0f0f0",
-    padding: 14,
-    borderRadius: 8,
-    opacity: disabled ? 0.6 : 1,
-  } as const;
-}
-
-export default function ShareStoryScreen() {
-  const { personId: selfPersonId, familyGroupId } = useSessionIds();
-  const [subject, setSubject] = useState<Subject>(null);
-  const [otherPerson, setOtherPerson] = useState<Person | null>(null);
-  const [starting, setStarting] = useState(false);
+// 2026-07-22 — the question-stream nudge (docs/section2_pipeline.md section
+// 4) finally gets a screen: GET /persons/:id/question-prompt and POST
+// /question-prompt/:id/answer existed API-only until now. A compact banner
+// above the three hub buttons, not a 4th equally-weighted button — this is a
+// lightweight "answer one quick question" aside, not a whole activity on the
+// same footing as "Share a memory" or "Tell your story", so it gets the same
+// treatment as the "Photos to review" button: present only when there's
+// something real to show, plain text, no icon to interpret.
+function QuestionPromptBanner({ personId }: { personId: string }) {
+  const queryClient = useQueryClient();
+  const [answer, setAnswer] = useState("");
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const { data: tree, isLoading: treeLoading } = useQuery({
-    queryKey: ["family-tree", familyGroupId],
-    queryFn: () => apiClient.getFamilyTree(familyGroupId ?? ""),
-    enabled: subject === "other" && Boolean(familyGroupId),
+  const { data } = useQuery({
+    queryKey: ["question-prompt", personId],
+    queryFn: () => apiClient.getQuestionPrompt(personId),
   });
-  const otherCandidates = (tree?.persons ?? []).filter((p) => p.id !== selfPersonId);
+  const question = data?.question ?? null;
 
-  const subjectPersonId = subject === "self" ? selfPersonId : subject === "other" ? otherPerson?.id ?? null : null;
-  const subjectLabel = subject === "self" ? "you" : otherPerson?.name ?? null;
-
-  function chooseSubject(next: Subject) {
+  async function submit() {
+    if (!question || !answer.trim()) {
+      setError("Write something first, or leave it for another time.");
+      return;
+    }
+    setSubmitting(true);
     setError(null);
-    setSubject(next);
-    if (next === "self") setOtherPerson(null);
-  }
-
-  async function startSession(questionId?: string, questionText?: string) {
-    if (!subjectPersonId) return;
-    setError(null);
-    setStarting(true);
     try {
-      const session = await apiClient.request<{ id: string }>("/interview-sessions", {
-        method: "POST",
-        body: { personId: subjectPersonId },
-      });
-      const params = new URLSearchParams();
-      params.set("personId", subjectPersonId);
-      if (questionId) params.set("questionId", questionId);
-      if (questionText) params.set("questionText", questionText);
-      router.push(`/interview/session/${session.id}?${params.toString()}`);
+      await apiClient.answerQuestionPrompt(question.id, { content: answer.trim() });
+      setAnswer("");
+      await queryClient.invalidateQueries({ queryKey: ["question-prompt", personId] });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Couldn't start this session — try again.");
+      setError(err instanceof Error ? err.message : "Couldn't save that — try again.");
     } finally {
-      setStarting(false);
+      setSubmitting(false);
     }
   }
 
-  // Adaptive Q&A: ask the API for the next question rather than always
-  // taking questions[0] — it works through the curated bank first, then
-  // (once that's exhausted) a Claude-generated follow-up based on what this
-  // person has actually talked about (GET /interview-questions/next, added
-  // alongside this screen). A 204 means there's nothing curated left AND
-  // nothing yet to build a follow-up from — falls back to the open-ended
-  // starting point instead of a dead end.
-  async function startQA() {
-    if (!subjectPersonId) return;
-    setError(null);
-    setStarting(true);
-    try {
-      const next = await apiClient.request<{ id: string; text: string } | undefined>(
-        `/interview-questions/next?personId=${subjectPersonId}`
-      );
-      if (!next) {
-        setError("Nothing personalized to ask yet — try “Share a memory” first, then come back to Q & A.");
-        return;
-      }
-      await startSession(next.id, next.text);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Couldn't load the next question — try again.");
-    } finally {
-      setStarting(false);
-    }
-  }
+  if (!question) return null;
+
+  return (
+    <View style={{ backgroundColor: "#fafafa", borderRadius: 12, padding: 16, gap: 10 }}>
+      <Text style={{ fontSize: 13, color: "#666", fontWeight: "600" }}>TODAY'S QUESTION</Text>
+      <Text style={{ fontSize: 16, fontWeight: "600" }}>{question.text}</Text>
+      <TextInput
+        placeholder="Type your answer…"
+        value={answer}
+        onChangeText={setAnswer}
+        multiline
+        style={{ borderWidth: 1, borderColor: "#ddd", borderRadius: 8, padding: 10, fontSize: 15, backgroundColor: "white", minHeight: 44 }}
+      />
+      <TouchableOpacity
+        onPress={submit}
+        disabled={submitting}
+        style={{ alignSelf: "flex-end", backgroundColor: "#1a73e8", paddingHorizontal: 16, paddingVertical: 10, borderRadius: 8, opacity: submitting ? 0.6 : 1 }}
+      >
+        <Text style={{ color: "white", fontWeight: "600" }}>{submitting ? "Saving…" : "Answer"}</Text>
+      </TouchableOpacity>
+      {error ? <Text style={{ color: "#b3261e", fontSize: 13 }}>{error}</Text> : null}
+    </View>
+  );
+}
+
+export default function ShareHubScreen() {
+  const { personId } = useSessionIds();
+
+  // Only shown at all when there's actually something waiting — an empty
+  // "Photos to review" button every time you open this tab is clutter, not
+  // a helpful constant option. Same GET /collection/proposed review.tsx
+  // itself reads from; a cache hit if that screen was already visited.
+  const { data: proposed } = useQuery({
+    queryKey: ["proposed-memories"],
+    queryFn: () => apiClient.request<{ items: unknown[] }>("/collection/proposed"),
+  });
+  const reviewCount = proposed?.items?.length ?? 0;
 
   return (
     <View style={{ flex: 1, padding: 16, gap: 16 }}>
-      <Text style={{ fontSize: 20, fontWeight: "600" }}>Share your story</Text>
+      <Text style={{ fontSize: 22, fontWeight: "700" }}>Share</Text>
 
-      <View>
-        <Text style={{ fontWeight: "600", marginBottom: 8 }}>Whose story is this?</Text>
-        <View style={{ flexDirection: "row", gap: 8 }}>
-          <TouchableOpacity style={chooserButtonStyle(subject === "self")} onPress={() => chooseSubject("self")}>
-            <Text style={{ color: subject === "self" ? "white" : "#1a1a1a", fontWeight: "600", textAlign: "center" }}>
-              My own story
-            </Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={chooserButtonStyle(subject === "other")} onPress={() => chooseSubject("other")}>
-            <Text style={{ color: subject === "other" ? "white" : "#1a1a1a", fontWeight: "600", textAlign: "center" }}>
-              Record someone else
-            </Text>
-          </TouchableOpacity>
-        </View>
-      </View>
+      {personId ? <QuestionPromptBanner personId={personId} /> : null}
 
-      {subject === "other" && !otherPerson ? (
-        <View style={{ gap: 4 }}>
-          {treeLoading ? (
-            <ActivityIndicator />
-          ) : otherCandidates.length === 0 ? (
-            <Text style={{ color: "#888" }}>No one else in the tree yet.</Text>
-          ) : (
-            otherCandidates.map((p) => (
-              <TouchableOpacity
-                key={p.id}
-                onPress={() => setOtherPerson(p)}
-                style={{ paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: "#eee" }}
-              >
-                <Text style={{ fontSize: 16 }}>{p.name}</Text>
-              </TouchableOpacity>
-            ))
-          )}
-        </View>
+      <HubButton
+        label="Share a memory"
+        sublabel="Write about something that happened, and say who it's about"
+        onPress={() => router.push("/share/compose")}
+      />
+
+      <HubButton
+        label="Tell your story"
+        sublabel="A guided conversation about your life, or someone else's"
+        onPress={() => router.push("/share/tell-your-story")}
+      />
+
+      {reviewCount > 0 ? (
+        <HubButton
+          label="Photos to review"
+          sublabel={`${reviewCount} photo${reviewCount === 1 ? "" : "s"} waiting for a quick look`}
+          onPress={() => router.push("/collection/review")}
+        />
       ) : null}
-
-      {subjectPersonId ? (
-        <View style={{ gap: 12 }}>
-          <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
-            <Text style={{ color: "#666" }}>Recording for {subjectLabel}</Text>
-            <TouchableOpacity onPress={() => chooseSubject(null)}>
-              <Text style={{ color: "#1a73e8" }}>Change</Text>
-            </TouchableOpacity>
-          </View>
-
-          {/* All three used to render with different styles ("Share a
-              memory" hardcoded blue, the other two grey) — that read as a
-              persistent selection highlight on "Share a memory" that never
-              moved even after tapping Q & A. These are three equal peer
-              choices, not one primary + two secondary, so all three now
-              share the same neutral style; none of them are a toggled/
-              selected state to begin with. */}
-          <TouchableOpacity onPress={() => startSession()} disabled={starting} style={activityButtonStyle(starting)}>
-            <Text style={{ fontWeight: "600", textAlign: "center" }}>Share a memory / talk about your life</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity onPress={startQA} disabled={starting} style={activityButtonStyle(starting)}>
-            <Text style={{ fontWeight: "600", textAlign: "center" }}>Q &amp; A</Text>
-          </TouchableOpacity>
-
-          {/* Photo capture itself isn't wired here yet — same note as before:
-              needs expo-image-picker + apiClient.presignUpload({context: "photo"})
-              + attaching via POST /interview-sessions/:id/answers' photoIds. */}
-          <TouchableOpacity onPress={() => startSession()} disabled={starting} style={activityButtonStyle(starting)}>
-            <Text style={{ fontWeight: "600", textAlign: "center" }}>Start with a picture and talk about it</Text>
-          </TouchableOpacity>
-        </View>
-      ) : null}
-
-      {error ? <Text style={{ color: "#b3261e", fontSize: 13 }}>{error}</Text> : null}
     </View>
   );
 }

@@ -10,7 +10,7 @@ export interface UpdateBiographyFromMemoryJobData {
 
 export interface MemoryBiographyDeps {
   classify: (content: string) => Promise<string | null>;
-  record: (params: { personId: string; personName: string; lifePhase: string; content: string }) => Promise<void>;
+  record: (params: { personId: string; personName: string; lifePhase: string; content: string; memoryId: string }) => Promise<void>;
 }
 
 const defaultDeps: MemoryBiographyDeps = {
@@ -83,7 +83,7 @@ export async function processUpdateBiographyFromMemoryJob(
   );
 
   for (const person of targetPersons) {
-    await deps.record({ personId: person.id, personName: person.name, lifePhase, content: memory.content });
+    await deps.record({ personId: person.id, personName: person.name, lifePhase, content: memory.content, memoryId });
   }
 
   return { memoryId, lifePhase, filedUnder: targetPersons.map((p) => p.id) };

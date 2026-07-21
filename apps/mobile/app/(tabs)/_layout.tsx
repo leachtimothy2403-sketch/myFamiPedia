@@ -1,14 +1,16 @@
 import { Tabs } from "expo-router";
 import { Ionicons, MaterialIcons } from "@expo/vector-icons";
 
-// Five tabs: Home, Tree (Explore folded in — see tree.tsx notes), Search
-// (memory content search — distinct from the by-name/by-decade grouping
-// already in the Tree tab; added this session, web's counterpart is
-// routes/search/index.tsx), Share (tab bar label shortened from "Share your
-// story" — it was truncating on real device widths; header title keeps the
-// fuller "Share your story" via `title`, only `tabBarLabel` is shortened),
-// Account. Tab bar previously had no icons at all (default placeholder
-// triangles), just text labels.
+// Five tabs: Home, Tree (structure view only as of 2026-07-20 — by-person
+// and by-decade browsing were removed from this tab, see tree.tsx), Search
+// (memory content search; added this session, web's counterpart is
+// routes/search/index.tsx), Share (2026-07-21 — this file's route is now a
+// flat hub with three big buttons: Share a memory / Tell your story / Photos
+// to review, replacing what used to be the interview-flow screen directly;
+// title changed from "Share your story" to plain "Share" since it covers
+// more than storytelling now — see share-story.tsx's own comment), Account.
+// Tab bar previously had no icons at all (default placeholder triangles),
+// just text labels.
 export default function TabsLayout() {
   return (
     <Tabs screenOptions={{ headerShown: true }}>
@@ -36,12 +38,11 @@ export default function TabsLayout() {
       <Tabs.Screen
         name="share-story"
         options={{
-          title: "Share your story",
-          tabBarLabel: "Share",
-          // Was a microphone, but this tab covers three starting points —
-          // free-form talking, Q&A, and photo-prompted — not just voice
-          // recording, so a conversation-bubble reads more accurately than
-          // an icon that implies audio-only.
+          title: "Share",
+          // Was a microphone, but this tab covers more than voice recording
+          // (a text memory, a guided interview, or a photo review), so a
+          // conversation-bubble reads more accurately than an icon that
+          // implies audio-only.
           tabBarIcon: ({ color, size }) => <Ionicons name="chatbox-ellipses-outline" size={size} color={color} />,
         }}
       />

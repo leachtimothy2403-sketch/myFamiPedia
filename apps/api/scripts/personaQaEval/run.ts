@@ -239,6 +239,7 @@ async function main() {
   let refreshToken = registerRes.body.refreshToken as string;
   const decoded = JSON.parse(Buffer.from(accessToken.split(".")[1], "base64").toString());
   const personId = decoded.personId as string;
+  const familyGroupId = decoded.familyGroupId as string;
 
   const sessionRes = await request()
     .post("/api/v1/interview-sessions")
@@ -340,11 +341,21 @@ ${gradingReport ?? "(not run — the interview loop failed before reaching the g
       // bypasses POST /interview-sessions/:id/answers (audio-only) rather
       // than faking audio, while still exercising the real
       // question-selection/generation endpoint above unchanged.
+      const [evalMemory] = await db("memories")
+        .insert({
+          family_group_id: familyGroupId,
+          contributor_id: personId,
+          content: answerText,
+          provenance_type: "voice",
+          provenance_label: q.text,
+        })
+        .returning("*");
       await db("interview_answers").insert({
         session_id: sessionId,
         question_id: q.id,
         audio_r2_key: "eval://not-a-real-recording",
         transcript: answerText,
+        memory_id: evalMemory.id,
       });
 
       // See the file header — this is the explicit stand-in for what
@@ -353,6 +364,11 @@ ${gradingReport ?? "(not run — the interview loop failed before reaching the g
       // loud, not silently leave a category's coverage signal stale for the
       // rest of a 90-question run the way it did before this was wired in
       // at all.
+      //
+      // 2026-07-20 — migration 028's interview_biography_sources needs a real
+      // memory_id now (so a later retraction of that memory could recompute
+      // this section) — evalMemory above is the eval's stand-in for the
+      // memories row processTranscribeJob would normally create.
       try {
         await recordAnswerInBiography(db, {
           personId,
@@ -360,6 +376,7 @@ ${gradingReport ?? "(not run — the interview loop failed before reaching the g
           lifePhase: q.life_phase,
           question: q.text,
           answer: answerText,
+          memoryId: evalMemory.id,
         });
       } catch (err) {
         console.warn(`  (biography update failed for question ${transcript.length + 1}, continuing: ${err instanceof Error ? err.message : String(err)})`);

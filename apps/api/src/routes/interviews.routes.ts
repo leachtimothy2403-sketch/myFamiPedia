@@ -2,10 +2,11 @@ import { Router } from "express";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { withRlsContext } from "../db/pool";
 import { transcriptionQueue } from "../jobs/queue";
-import { processTranscribeJob } from "../jobs/transcribeAnswer";
+import { processTranscribeJob, finalizeTranscribedAnswer } from "../jobs/transcribeAnswer";
 import { HttpError } from "../utils/httpError";
 import { generateFollowUpQuestion, synthesizeBiography } from "../services/claude.service";
 import { getBiographySections } from "../services/biography.service";
+import { recordClarificationSkipped, recordClarificationAnswered } from "../services/clarification.service";
 import { env } from "../config/env";
 
 export const interviewsRouter = Router();
@@ -184,18 +185,27 @@ interviewsRouter.post("/interview-sessions", requireAuth, async (req: AuthedRequ
   }
 });
 
-// Attaches a recorded answer (audio) to a question. photoIds are photos
-// captured/uploaded mid-conversation (docs/voice_pipeline.md's "Mid-
-// conversation photo capture") — staged in interview_answer_photos since the
-// memory this answer will become doesn't exist yet; Q_TRANS promotes them to
-// memory_photos once the memory row is created (see the migration comment
-// on interview_answer_photos).
+// Attaches a recorded answer to a question — audio (audioR2Key, the
+// original path) or, as of 2026-07-21/22, plain text (content) as an
+// alternative. photoIds are photos captured/uploaded mid-conversation
+// (docs/voice_pipeline.md's "Mid-conversation photo capture") — staged in
+// interview_answer_photos since the memory this answer will become doesn't
+// exist yet; Q_TRANS promotes them to memory_photos once the memory row is
+// created (see the migration comment on interview_answer_photos).
+//
+// clarifiesAnswerId marks this answer as a response to a clarifying
+// follow-up offered on an earlier answer in this same session (migration
+// 029) — mainly meant for a quick typed answer (a name, a date) rather than
+// re-recording voice for one word, but works either way (voice clarification
+// answers just pass this alongside audioR2Key). Resets the session's
+// skip-streak counter, same "a real answer, not a skip" signal the skip
+// endpoint below is the mirror image of.
 interviewsRouter.post("/interview-sessions/:id/answers", requireAuth, async (req: AuthedRequest, res, next) => {
   try {
     const { personId, familyGroupId } = req.auth!;
-    const { questionId, audioR2Key, photoIds } = req.body ?? {};
-    if (!audioR2Key) {
-      return res.status(400).json({ error: "audioR2Key is required" });
+    const { questionId, audioR2Key, content, photoIds, clarifiesAnswerId } = req.body ?? {};
+    if (!audioR2Key && !content) {
+      return res.status(400).json({ error: "audioR2Key or content is required" });
     }
 
     const answer = await withRlsContext({ personId, familyGroupId }, async (trx) => {
@@ -203,11 +213,22 @@ interviewsRouter.post("/interview-sessions/:id/answers", requireAuth, async (req
       if (!session) throw new HttpError(404, "Interview session not found");
       if (session.status !== "in_progress") throw new HttpError(409, "This session is not in progress");
 
+      if (clarifiesAnswerId) {
+        const original = await trx("interview_answers").where({ id: clarifiesAnswerId, session_id: session.id }).first();
+        if (!original) throw new HttpError(404, "The answer this is clarifying wasn't found in this session");
+      }
+
       // questionId is optional — open-ended answers (mobile's "Share a
       // memory" and "Start with a picture" starting points) have no
       // specific question attached (see migration 021).
       const [row] = await trx("interview_answers")
-        .insert({ session_id: session.id, question_id: questionId ?? null, audio_r2_key: audioR2Key })
+        .insert({
+          session_id: session.id,
+          question_id: questionId ?? null,
+          audio_r2_key: audioR2Key ?? null,
+          transcript: content ?? null,
+          clarifies_answer_id: clarifiesAnswerId ?? null,
+        })
         .returning("*");
 
       if (Array.isArray(photoIds) && photoIds.length > 0) {
@@ -218,34 +239,79 @@ interviewsRouter.post("/interview-sessions/:id/answers", requireAuth, async (req
       return row;
     });
 
-    // Transcribe now, synchronously, rather than waiting for
-    // /complete — GET /interview-questions/next needs this answer's real
-    // text immediately to build the next adaptive follow-up within the
-    // same still-open session; queuing it for later meant every "next
-    // question" call during a live session only ever saw stale content
-    // from previous, already-completed sessions. Adds real latency to this
-    // request (a network round trip to ElevenLabs), which is an accepted
-    // trade for the session screen's existing "Saving…" state. Failure
-    // here (bad key, network blip) shouldn't lose the recording — the
-    // audio is already safely in R2 — so it's swallowed and left to the
-    // /complete handler's queue-based safety net below.
-    if (env.elevenlabsApiKey && env.r2.accountId) {
+    let clarifyingQuestion: string | null = null;
+    if (content) {
+      // Text answer — it IS its own transcript, no transcription step
+      // needed, same principle as collection.routes.ts's question-prompt
+      // text path. Goes straight through the same finalize logic a voice
+      // answer reaches once transcribed, so biography recording and the
+      // clarification check both happen the same way regardless of which
+      // path an answer came in through.
       try {
-        await processTranscribeJob({ interviewAnswerId: answer.id });
+        const result = await finalizeTranscribedAnswer(answer.id, content, "text");
+        clarifyingQuestion = result.clarifyingQuestion;
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`[interviews] finalizing text answer failed for answer ${answer.id}:`, err);
+      }
+    } else if (env.elevenlabsApiKey && env.r2.accountId) {
+      // Transcribe now, synchronously, rather than waiting for
+      // /complete — GET /interview-questions/next needs this answer's real
+      // text immediately to build the next adaptive follow-up within the
+      // same still-open session; queuing it for later meant every "next
+      // question" call during a live session only ever saw stale content
+      // from previous, already-completed sessions. Adds real latency to this
+      // request (a network round trip to ElevenLabs), which is an accepted
+      // trade for the session screen's existing "Saving…" state. Failure
+      // here (bad key, network blip) shouldn't lose the recording — the
+      // audio is already safely in R2 — so it's swallowed and left to the
+      // /complete handler's queue-based safety net below.
+      try {
+        const result = await processTranscribeJob({ interviewAnswerId: answer.id });
+        clarifyingQuestion = result.clarifyingQuestion;
       } catch (err) {
         // eslint-disable-next-line no-console
         console.error(`[interviews] synchronous transcription failed for answer ${answer.id}:`, err);
       }
     }
-    // Both unset just means transcription isn't configured yet at all (or
-    // this is a test run) — skip quietly rather than logging an error on
-    // every single answer for a known, already-surfaced-elsewhere gap.
+    // Neither branch above just means transcription isn't configured yet at
+    // all (or this is a test run) — skip quietly rather than logging an
+    // error on every single answer for a known, already-surfaced-elsewhere gap.
 
-    res.status(201).json(answer);
+    if (clarifiesAnswerId) {
+      await withRlsContext({ personId, familyGroupId }, (trx) => recordClarificationAnswered(trx, req.params.id));
+    }
+
+    res.status(201).json({ ...answer, clarifyingQuestion });
   } catch (err) {
     next(err);
   }
 });
+
+// The clarifying follow-up's skip path — deliberately as close to a no-op as
+// possible (a single counter increment, see clarification.service.ts) so
+// skipping is never slower or more effortful than actually answering. Two
+// skips in a row (SKIP_STREAK_BACKOFF_THRESHOLD) stops clarifications from
+// being offered again for the rest of this session.
+interviewsRouter.post(
+  "/interview-sessions/:id/answers/:answerId/skip-clarification",
+  requireAuth,
+  async (req: AuthedRequest, res, next) => {
+    try {
+      const { personId, familyGroupId } = req.auth!;
+      await withRlsContext({ personId, familyGroupId }, async (trx) => {
+        const session = await trx("interview_sessions").where({ id: req.params.id }).first();
+        if (!session) throw new HttpError(404, "Interview session not found");
+        const answer = await trx("interview_answers").where({ id: req.params.answerId, session_id: session.id }).first();
+        if (!answer) throw new HttpError(404, "Answer not found in this session");
+        await recordClarificationSkipped(trx, session.id);
+      });
+      res.status(204).send();
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 // Ends the session. Most answers are already transcribed by now — the
 // /answers handler transcribes synchronously on save — this only enqueues a

@@ -58,9 +58,22 @@ describe("biography.service", () => {
     return person;
   }
 
+  // recordAnswerInBiography/recordMemoryInBiography require a real memoryId
+  // (migration 028's interview_biography_sources FK) — every real call site
+  // already has, or just created, a memories row for this exact content, so
+  // tests need one too rather than a bare placeholder string.
+  async function createMemory(person: { id: string; family_group_id: string }, content: string) {
+    const [memory] = await ctx
+      .knex()("memories")
+      .insert({ family_group_id: person.family_group_id, contributor_id: person.id, content, provenance_type: "text" })
+      .returning("*");
+    return memory;
+  }
+
   it("creates a new section on the first answer in a category", async () => {
     const { recordAnswerInBiography, getBiographySections } = await import("../../src/services/biography.service");
     const person = await createPerson();
+    const memory = await createMemory(person, "We lived two streets from the rail yard.");
     mockClaudeSummary("Grew up two streets from the rail yard.");
 
     await recordAnswerInBiography(ctx.knex(), {
@@ -69,6 +82,7 @@ describe("biography.service", () => {
       lifePhase: "childhood",
       question: "What was your street like?",
       answer: "We lived two streets from the rail yard.",
+      memoryId: memory.id,
     });
 
     const sections = await getBiographySections(ctx.knex(), person.id);
@@ -86,21 +100,25 @@ describe("biography.service", () => {
     const person = await createPerson();
 
     mockClaudeSummary("Grew up two streets from the rail yard.");
+    const memoryA = await createMemory(person, "We lived two streets from the rail yard.");
     await recordAnswerInBiography(ctx.knex(), {
       personId: person.id,
       personName: person.name,
       lifePhase: "childhood",
       question: "What was your street like?",
       answer: "We lived two streets from the rail yard.",
+      memoryId: memoryA.id,
     });
 
     mockClaudeSummary("Grew up two streets from the rail yard and rescued a stray cat named Rusty at nine.");
+    const memoryB = await createMemory(person, "Yes, a stray cat I named Rusty.");
     await recordAnswerInBiography(ctx.knex(), {
       personId: person.id,
       personName: person.name,
       lifePhase: "childhood",
       question: "Did you ever have a pet growing up?",
       answer: "Yes, a stray cat I named Rusty.",
+      memoryId: memoryB.id,
     });
 
     const sections = await getBiographySections(ctx.knex(), person.id);
@@ -115,21 +133,25 @@ describe("biography.service", () => {
     const person = await createPerson();
 
     mockClaudeSummary("Grew up two streets from the rail yard.");
+    const memoryA = await createMemory(person, "We lived two streets from the rail yard.");
     await recordAnswerInBiography(ctx.knex(), {
       personId: person.id,
       personName: person.name,
       lifePhase: "childhood",
       question: "What was your street like?",
       answer: "We lived two streets from the rail yard.",
+      memoryId: memoryA.id,
     });
 
     mockClaudeSummary("Worked at Kessler's Department Store as a teenager.");
+    const memoryB = await createMemory(person, "Kessler's Department Store.");
     await recordAnswerInBiography(ctx.knex(), {
       personId: person.id,
       personName: person.name,
       lifePhase: "work",
       question: "What was your first job?",
       answer: "Kessler's Department Store.",
+      memoryId: memoryB.id,
     });
 
     const sections = await getBiographySections(ctx.knex(), person.id);
@@ -140,6 +162,7 @@ describe("biography.service", () => {
   it("passes the existing summary and new Q&A through to the Claude call", async () => {
     const { recordAnswerInBiography } = await import("../../src/services/biography.service");
     const person = await createPerson();
+    const memory = await createMemory(person, "We lived two streets from the rail yard.");
 
     let capturedPrompt = "";
     vi.stubGlobal(
@@ -156,6 +179,7 @@ describe("biography.service", () => {
       lifePhase: "childhood",
       question: "What was your street like?",
       answer: "We lived two streets from the rail yard.",
+      memoryId: memory.id,
     });
 
     expect(capturedPrompt).toContain("Peggy");
@@ -178,6 +202,7 @@ describe("biography.service", () => {
     it("creates a section from a memory the same way an interview answer would", async () => {
       const { recordMemoryInBiography, getBiographySections } = await import("../../src/services/biography.service");
       const person = await createPerson();
+      const memory = await createMemory(person, "I found a stray cat behind the rail yard and named him Rusty.");
       mockClaudeSummary("Rescued a stray cat named Rusty at nine.");
 
       await recordMemoryInBiography(ctx.knex(), {
@@ -185,6 +210,7 @@ describe("biography.service", () => {
         personName: person.name,
         lifePhase: "childhood",
         content: "I found a stray cat behind the rail yard and named him Rusty.",
+        memoryId: memory.id,
       });
 
       const sections = await getBiographySections(ctx.knex(), person.id);
@@ -201,20 +227,24 @@ describe("biography.service", () => {
       const person = await createPerson();
 
       mockClaudeSummary("Grew up two streets from the rail yard.");
+      const memoryA = await createMemory(person, "We lived two streets from the rail yard.");
       await recordAnswerInBiography(ctx.knex(), {
         personId: person.id,
         personName: person.name,
         lifePhase: "childhood",
         question: "What was your street like?",
         answer: "We lived two streets from the rail yard.",
+        memoryId: memoryA.id,
       });
 
       mockClaudeSummary("Grew up two streets from the rail yard and rescued a stray cat named Rusty at nine.");
+      const memoryB = await createMemory(person, "I found a stray cat behind the rail yard and named him Rusty.");
       await recordMemoryInBiography(ctx.knex(), {
         personId: person.id,
         personName: person.name,
         lifePhase: "childhood",
         content: "I found a stray cat behind the rail yard and named him Rusty.",
+        memoryId: memoryB.id,
       });
 
       const sections = await getBiographySections(ctx.knex(), person.id);
@@ -234,19 +264,23 @@ describe("biography.service", () => {
       const person = await createPerson();
 
       mockClaudeSummary("Summary after first memory.");
+      const memoryA = await createMemory(person, "My first job was at Kessler's Department Store.");
       await recordMemoryInBiography(ctx.knex(), {
         personId: person.id,
         personName: person.name,
         lifePhase: "work",
         content: "My first job was at Kessler's Department Store.",
+        memoryId: memoryA.id,
       });
 
       mockClaudeSummary("Summary after second memory.");
+      const memoryB = await createMemory(person, "I got promoted to floor manager after two years there.");
       await recordMemoryInBiography(ctx.knex(), {
         personId: person.id,
         personName: person.name,
         lifePhase: "work",
         content: "I got promoted to floor manager after two years there.",
+        memoryId: memoryB.id,
       });
 
       const sections = await getBiographySections(ctx.knex(), person.id);
@@ -258,6 +292,7 @@ describe("biography.service", () => {
     it("passes the memory content through to the Claude call as the answer, with a synthesized stem as the question", async () => {
       const { recordMemoryInBiography } = await import("../../src/services/biography.service");
       const person = await createPerson();
+      const memory = await createMemory(person, "My first job was at Kessler's Department Store.");
 
       let capturedPrompt = "";
       vi.stubGlobal(
@@ -273,10 +308,92 @@ describe("biography.service", () => {
         personName: person.name,
         lifePhase: "work",
         content: "My first job was at Kessler's Department Store.",
+        memoryId: memory.id,
       });
 
       expect(capturedPrompt).toContain("My first job was at Kessler's Department Store.");
       expect(capturedPrompt).toContain("memory shared");
+    });
+  });
+
+  // recomputeBiographySection — the rebuild-from-scratch fix for retraction
+  // (biography.service.ts's own comment on it; migration 028). Unit-level
+  // coverage complementing the route-level tests in memories.test.ts, which
+  // exercise this through the real retract/restore endpoints.
+  describe("recomputeBiographySection", () => {
+    it("rebuilds the summary and stems from only the surviving (non-retracted) sources", async () => {
+      const { recordAnswerInBiography, recomputeBiographySection, getBiographySections } = await import(
+        "../../src/services/biography.service"
+      );
+      const person = await createPerson();
+
+      mockClaudeSummary("Grew up two streets from the rail yard.");
+      const memoryA = await createMemory(person, "We lived two streets from the rail yard.");
+      await recordAnswerInBiography(ctx.knex(), {
+        personId: person.id,
+        personName: person.name,
+        lifePhase: "childhood",
+        question: "What was your street like?",
+        answer: "We lived two streets from the rail yard.",
+        memoryId: memoryA.id,
+      });
+
+      mockClaudeSummary("Grew up two streets from the rail yard and rescued a stray cat named Rusty at nine.");
+      const memoryB = await createMemory(person, "I found a stray cat and named him Rusty.");
+      await recordAnswerInBiography(ctx.knex(), {
+        personId: person.id,
+        personName: person.name,
+        lifePhase: "childhood",
+        question: "Did you ever have a pet growing up?",
+        answer: "I found a stray cat and named him Rusty.",
+        memoryId: memoryB.id,
+      });
+
+      // Simulate memoryB being retracted, then recompute — same call
+      // memories.routes.ts's retract handler makes.
+      await ctx.knex()("memories").where({ id: memoryB.id }).update({ retracted: true, retracted_at: new Date() });
+      mockClaudeSummary("Grew up two streets from the rail yard.");
+      await recomputeBiographySection(ctx.knex(), { personId: person.id, personName: person.name, lifePhase: "childhood" });
+
+      const sections = await getBiographySections(ctx.knex(), person.id);
+      expect(sections).toHaveLength(1);
+      expect(sections[0].summary).toBe("Grew up two streets from the rail yard.");
+      expect(sections[0].askedQuestionStems).toEqual(["What was your street like?"]);
+      expect(sections[0].questionCount).toBe(1);
+    });
+
+    it("deletes the section when its only source has been retracted", async () => {
+      const { recordAnswerInBiography, recomputeBiographySection, getBiographySections } = await import(
+        "../../src/services/biography.service"
+      );
+      const person = await createPerson();
+
+      mockClaudeSummary("Grew up two streets from the rail yard.");
+      const memory = await createMemory(person, "We lived two streets from the rail yard.");
+      await recordAnswerInBiography(ctx.knex(), {
+        personId: person.id,
+        personName: person.name,
+        lifePhase: "childhood",
+        question: "What was your street like?",
+        answer: "We lived two streets from the rail yard.",
+        memoryId: memory.id,
+      });
+
+      await ctx.knex()("memories").where({ id: memory.id }).update({ retracted: true, retracted_at: new Date() });
+      await recomputeBiographySection(ctx.knex(), { personId: person.id, personName: person.name, lifePhase: "childhood" });
+
+      const sections = await getBiographySections(ctx.knex(), person.id);
+      expect(sections).toHaveLength(0);
+    });
+
+    it("is a no-op for a person/category with no section at all", async () => {
+      const { recomputeBiographySection, getBiographySections } = await import("../../src/services/biography.service");
+      const person = await createPerson();
+
+      await recomputeBiographySection(ctx.knex(), { personId: person.id, personName: person.name, lifePhase: "childhood" });
+
+      const sections = await getBiographySections(ctx.knex(), person.id);
+      expect(sections).toHaveLength(0);
     });
   });
 });

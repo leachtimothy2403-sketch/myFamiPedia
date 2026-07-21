@@ -52,7 +52,8 @@ REST API, Node.js/Express. Auth via JWT access token + refresh token (Redis-back
 |---|---|---|
 | GET | `/interview-questions` | Curated bank, filterable by life phase |
 | POST | `/interview-sessions` | Start facilitated session against a profile |
-| POST | `/interview-sessions/:id/answers` | Attach recorded answer (audio) to a question |
+| POST | `/interview-sessions/:id/answers` | Attach an answer to a question — audio (`audioR2Key`) or text (`content`, 2026-07-21). `clarifiesAnswerId` marks this as answering an offered clarifying follow-up (migration 029) |
+| POST | `/interview-sessions/:id/answers/:answerId/skip-clarification` | Declines an offered clarifying follow-up (2026-07-21) — increments the session's skip-streak backoff counter |
 | POST | `/interview-sessions/:id/complete` | Ends session → triggers transcription job → notifies family |
 | GET | `/interview-sessions/:id` | Session status/transcript |
 
